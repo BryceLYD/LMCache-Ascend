@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "cachegen_kernels.h"
+#include "completion_recorder.h"
 #include "dcmi_management.h"
+#include "event_recorder.h"
 #include "managed_mem.h"
 #include "mem_alloc.h"
 #include "mem_kernels.h"
@@ -105,4 +107,24 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("pac_prepare_enc_metadata", &pac_prepare_enc_metadata);
   m.def("pac_encode", &pac_encode);
   m.def("pac_decode", &pac_decode);
+
+  m.def("record_event_on_stream", &record_event_on_stream,
+        py::arg("cuda_stream_ptr"), py::arg("event_type_name"),
+        py::arg("session_id"), py::arg("str_metadata"),
+        py::arg("int_metadata"),
+        py::call_guard<py::gil_scoped_release>());
+  m.def("drain_recorded_events", &drain_recorded_events);
+  m.def("record_completion_on_stream", &record_completion_on_stream,
+        py::arg("cuda_stream_ptr"), py::arg("kind"), py::arg("payload"),
+        py::call_guard<py::gil_scoped_release>());
+  // Return each payload as py::bytes; pybind11 utf-8-decodes std::string
+  // by default, corrupting binary payloads (e.g. msgpack).
+  m.def("drain_recorded_completions", []() {
+    auto items = drain_recorded_completions();
+    py::list out;
+    for (auto& kv : items) {
+      out.append(py::make_tuple(py::str(kv.first), py::bytes(kv.second)));
+    }
+    return out;
+  });
 }
