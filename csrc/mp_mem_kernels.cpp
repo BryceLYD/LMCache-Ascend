@@ -456,7 +456,7 @@ void multi_layer_block_kv_transfer(
       static_cast<uint8_t *>(paged_buffer_ptrs_tensor.data_ptr());
   int64_t *block_ids_base = block_ids.data_ptr<int64_t>();
 
-  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
 
   at_npu::native::OpCommand cmd;
   cmd.Name("multi_layer_block_transfer_kernel");
@@ -509,7 +509,7 @@ void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
                           size_t host_buffer_alignments) {
   lmcache_memcpy_async_on_stream(dest, src, nbytes, direction,
                                  host_buffer_offset, host_buffer_alignments,
-                                 c10_npu::getCurrentNPUStream().stream());
+                                  c10_npu::getCurrentNPUStream().stream(false));
 }
 
 void execute_object_group_transfer(
@@ -584,7 +584,7 @@ void execute_object_group_transfer(
   auto ascendcPlatform =
       platform_ascendc::PlatformAscendCManager::GetInstance(socName);
   const uint32_t aiv_num = ascendcPlatform->GetCoreNumAiv();
-  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
 
   at_npu::native::OpCommand cmd;
   cmd.Name("multi_layer_block_transfer_kernel");
