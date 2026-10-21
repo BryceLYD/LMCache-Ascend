@@ -507,9 +507,13 @@ void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
                           TransferDirection direction,
                           size_t host_buffer_offset,
                           size_t host_buffer_alignments) {
+  // Direct aclrtMemcpyAsync on the calling thread (no OpCommand): the task
+  // queue's FIFO does not order this enqueue, so keep the draining getter
+  // to order it after pending task-queue work (ACLNN launches, event
+  // record/wait) on the same stream.
   lmcache_memcpy_async_on_stream(dest, src, nbytes, direction,
                                  host_buffer_offset, host_buffer_alignments,
-                                  c10_npu::getCurrentNPUStream().stream(false));
+                                 c10_npu::getCurrentNPUStream().stream());
 }
 
 void execute_object_group_transfer(
