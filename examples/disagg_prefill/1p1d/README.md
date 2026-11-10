@@ -23,6 +23,7 @@ The `transfer_channel` field in the LMCache YAML config selects the NPU communic
 | :--- | :--- | :--- |
 | `hccl` | CANN 8.5+ | **Recommended** |
 | `hixl` | CANN 8.5+ | Experimental |
+| `mooncake` | `mooncake` built with `-DUSE_ASCEND_DIRECT=ON` | Experimental (PD only, no P2P) |
 
 To switch channels, update the `transfer_channel` field in your YAML configs:
 
@@ -32,6 +33,9 @@ transfer_channel: "hccl"
 
 # CANN 8.5+ (Experimental)
 transfer_channel: "hixl"
+
+# Mooncake TE (Experimental, PD only)
+transfer_channel: "mooncake"
 ```
 
 
