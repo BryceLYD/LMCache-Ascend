@@ -431,10 +431,33 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        spec = self._pd_specs.get(request.request_id)
         result = super().request_finished(request, block_ids)
         self._ledgers.pop(request.request_id, None)
         self._pd_specs.pop(request.request_id, None)
         self._pd_load_issued.discard(request.request_id)
+        # Disagg proxy handshake: the proxy reads first_tok from the
+        # prefill response's kv_transfer_params to build the decode
+        # request (prefill generates the first token, decode continues
+        # from the second). vLLM natively echoes the connector's
+        # request_finished params into the response, but the MP
+        # connector super-chain never produces first_tok — fill it here
+        # for disagg-routed prefill requests.
+        kv_role = getattr(
+            getattr(self._vllm_config, "kv_transfer_config", None),
+            "kv_role",
+            None,
+        )
+        if (
+            spec is not None
+            and kv_role == "kv_producer"
+            and isinstance(result, tuple)
+        ):
+            output_ids = getattr(request, "output_token_ids", None) or []
+            if output_ids:
+                params = dict(result[1] or {})
+                params.setdefault("first_tok", output_ids[0])
+                result = (result[0], params)
         return result
 
     # ==============================

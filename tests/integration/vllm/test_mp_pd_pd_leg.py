@@ -15,6 +15,7 @@ machine, not here.
 
 # Standard
 from types import SimpleNamespace
+from unittest.mock import patch
 import importlib
 
 # Third Party
@@ -506,3 +507,66 @@ def test_pd_only_policy_suppresses_l1_stores_and_restores():
         assert len(metadata.requests) == 2
     finally:
         connector._get_connector_metadata = original_get
+
+
+def test_request_finished_returns_first_tok_for_disagg_prefill():
+    """The disagg proxy reads first_tok from the prefill response's
+    kv_transfer_params; the connector must supply it for disagg-routed
+    producer requests (the prefill generates exactly the first token)."""
+    stack = _import_stack()
+    connector, _ = _make_scheduler_connector()
+    connector._vllm_config.kv_transfer_config.kv_role = "kv_producer"
+    spec = stack.pd_engine_mod.extract_pd_transfer_spec(_fake_request())
+    connector._pd_specs["r1"] = spec
+
+    request = SimpleNamespace(request_id="r1", output_token_ids=[4242])
+
+    # Third Party
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+
+    with patch.object(
+        LMCacheMPConnector, "request_finished", return_value=(True, None)
+    ):
+        save, params = connector.request_finished(request, [])
+
+    assert save is True
+    assert params["first_tok"] == 4242
+    assert "r1" not in connector._pd_specs
+
+
+def test_request_finished_skips_first_tok_without_disagg_spec():
+    stack = _import_stack()
+    connector, _ = _make_scheduler_connector()
+    connector._vllm_config.kv_transfer_config.kv_role = "kv_producer"
+
+    request = SimpleNamespace(request_id="r9", output_token_ids=[7])
+
+    # Third Party
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+
+    with patch.object(
+        LMCacheMPConnector, "request_finished", return_value=(True, None)
+    ):
+        _, params = connector.request_finished(request, [])
+
+    assert params is None
+
+
+def test_request_finished_skips_first_tok_on_consumer():
+    stack = _import_stack()
+    connector, _ = _make_scheduler_connector()
+    connector._vllm_config.kv_transfer_config.kv_role = "kv_consumer"
+    spec = stack.pd_engine_mod.extract_pd_transfer_spec(_fake_request())
+    connector._pd_specs["r1"] = spec
+
+    request = SimpleNamespace(request_id="r1", output_token_ids=[4242])
+
+    # Third Party
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+
+    with patch.object(
+        LMCacheMPConnector, "request_finished", return_value=(True, None)
+    ):
+        _, params = connector.request_finished(request, [])
+
+    assert params is None
