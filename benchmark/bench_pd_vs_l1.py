@@ -161,8 +161,17 @@ def run_d2d(args) -> None:
         done.bind(f"tcp://{args.bind_ip}:{args.done_port}")
         print(f"[receiver] waiting on {args.bind_ip}:{args.init_port} "
               f"(channel={args.channel}, device=npu:{args.device})")
+        # The clock starts at the sender's START marker (sent after its
+        # warmup), not at bind: waiting for the sender to come up is not
+        # transfer time. A bare DONE (no marker) still reports with the
+        # bind-time fallback.
         t0 = time.perf_counter()
-        done.recv()
+        while True:
+            msg = done.recv()
+            if msg == b"START":
+                t0 = time.perf_counter()
+                continue
+            break
         _report("receiver", args.iters * total_bytes,
                 time.perf_counter() - t0, args.iters)
         done.close(0)
@@ -194,6 +203,7 @@ def run_d2d(args) -> None:
     for _ in range(args.warmup):
         chan.batched_write(objs, spec)
     torch.npu.synchronize()
+    done.send(b"START")
 
     t0 = time.perf_counter()
     for _ in range(args.iters):
