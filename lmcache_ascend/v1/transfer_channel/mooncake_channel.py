@@ -491,6 +491,27 @@ class MooncakeChannel(BaseMultiBufferChannel):
         )
         return len(buffers)
 
+    async def async_batched_write(
+        self,
+        objects: Union[list[bytes], list[MemoryObj]],
+        transfer_spec: Optional[dict] = None,
+    ) -> int:
+        """ABC-required override; no async write is wired for Mooncake yet.
+
+        The upstream ``BaseTransferChannel`` declares
+        ``async_batched_write`` abstract, so the channel must override it
+        to be instantiable at all. Raising here keeps the documented
+        contract explicit: the PD push path drives the synchronous
+        ``batched_write``, and P2P KV sharing (which drives writes from
+        an asyncio loop and needs the host-staging surface) stays on the
+        hccl/hixl channels.
+        """
+        raise NotImplementedError(
+            "MooncakeChannel does not implement async_batched_write; "
+            "use the synchronous batched_write (PD push path) or the "
+            "hccl/hixl channels for P2P KV sharing"
+        )
+
     async def async_batched_read(
         self,
         buffers: Union[list[bytes], list[MemoryObj]],
@@ -502,9 +523,8 @@ class MooncakeChannel(BaseMultiBufferChannel):
         via ``run_coroutine_threadsafe(...).result()`` and block until the
         read completes, so there is no concurrency to exploit yet. Future
         work swaps this for Mooncake's async API (batch_transfer + status
-        polling). ``async_batched_write`` is deliberately not provided:
-        the P2P backend needs the full async + staging surface, which
-        only the hccl/hixl channels offer today.
+        polling). The write counterpart raises NotImplementedError so
+        P2P KV sharing stays on the hccl/hixl channels.
         """
         return self.batched_read(buffers, transfer_spec)
 

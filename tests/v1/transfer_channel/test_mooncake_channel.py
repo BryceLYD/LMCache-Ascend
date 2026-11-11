@@ -347,6 +347,27 @@ def test_async_batched_read_delegates_to_sync(fake_mooncake, monkeypatch):
         chan_b.close()
 
 
+def test_async_batched_write_raises(fake_mooncake, monkeypatch):
+    """The upstream ABC declares async_batched_write abstract; the channel
+    overrides it to stay instantiable but keeps the failure explicit, so
+    P2P KV sharing stays on the hccl/hixl channels."""
+    chan_a, chan_b = _make_peer_pair(fake_mooncake, monkeypatch)
+    try:
+        chan_a.lazy_init_peer_connection(
+            local_id="A", peer_id="B", peer_init_url=chan_b.peer_init_url
+        )
+        with pytest.raises(NotImplementedError, match="async_batched_write"):
+            asyncio.run(
+                chan_a.async_batched_write(
+                    [_FakeMemObj(BUF_A, 0)], _transfer_spec(chan_b)
+                )
+            )
+        assert chan_a.engine.transfers == []
+    finally:
+        chan_a.close()
+        chan_b.close()
+
+
 def test_batched_write_failure_raises_runtime_error(fake_mooncake, monkeypatch):
     chan_a, chan_b = _make_peer_pair(fake_mooncake, monkeypatch)
     try:
