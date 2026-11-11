@@ -244,6 +244,23 @@ def test_close_unregisters_buffers(fake_mooncake, monkeypatch):
     assert chan.engine.unregistered == [(BUF_A, 8 * PAGE)]
 
 
+def test_close_unregisters_single_argument_layout(monkeypatch):
+    """The repackaged build's unregister_memory takes the address only."""
+    class _OneArgEngine(FakeMooncakeEngine):
+        def unregister_memory(self, addr):
+            self.unregistered.append((addr, None))
+            return 0
+
+    fake = types.SimpleNamespace(
+        TransferEngine=_OneArgEngine, TransferOpcode=_FakeTransferOpcode
+    )
+    monkeypatch.setitem(sys.modules, "mooncake", fake)
+    _patch_npu(monkeypatch)
+    chan = _make_channel(peer_init_url=f"127.0.0.1:{_free_port()}")
+    chan.close()
+    assert chan.engine.unregistered == [(BUF_A, None)]
+
+
 def test_timeout_misconfiguration_warns(fake_mooncake, monkeypatch, caplog):
     _patch_npu(monkeypatch)
     monkeypatch.setenv("MC_TRANSFER_TIMEOUT", "5")

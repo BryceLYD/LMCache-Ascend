@@ -648,6 +648,15 @@ class MooncakeChannel(BaseMultiBufferChannel):
     # Teardown
     # ------------------------------------------------------------------
 
+    def _unregister_memory(self, ptr: int, size: int) -> None:
+        """Layout-adaptive unregister: the repackaged NPU build takes the
+        address only; the canonical wheel takes (addr, length)."""
+        try:
+            ret = self.engine.unregister_memory(ptr)
+        except TypeError:
+            ret = self.engine.unregister_memory(ptr, size)
+        _check_status(ret, f"unregister_memory(ptr={hex(ptr)})")
+
     def close(self):
         self.running = False
         for thread in self.running_threads:
@@ -657,6 +666,6 @@ class MooncakeChannel(BaseMultiBufferChannel):
             for meta in self.mem_handles:
                 try:
                     ptr, size = meta.mem_handle
-                    self.engine.unregister_memory(ptr, size)
+                    self._unregister_memory(ptr, size)
                 except Exception as e:
                     logger.warning("Failed to unregister Mooncake memory: %s", e)
