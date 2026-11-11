@@ -153,6 +153,42 @@ def _validate_transfer_timeouts() -> None:
         )
 
 
+# Enum-member spellings seen across mooncake builds: the canonical
+# wheel uses WRITE/READ; repackaged NPU trees have been observed with
+# other spellings/prefixes.
+_WRITE_NAMES = ("WRITE", "OP_WRITE", "Write", "write")
+_READ_NAMES = ("READ", "OP_READ", "Read", "read")
+
+
+def _resolve_opcodes(mod) -> tuple:
+    """Resolve (write, read) opcode values from a mooncake API module.
+
+    Tolerates enum-member naming differences between builds. Raises
+    with the visible member names when nothing matches, so yet another
+    spelling is identifiable at a glance. No silent integer fallback:
+    mixing up the transfer direction would corrupt data, so an unknown
+    layout must fail loudly.
+    """
+    enum = getattr(mod, "TransferOpcode", None)
+    if enum is None:
+        raise AttributeError(
+            f"{mod.__name__} has no TransferOpcode; cannot resolve opcodes"
+        )
+    write_op = next(
+        (getattr(enum, n) for n in _WRITE_NAMES if hasattr(enum, n)), None
+    )
+    read_op = next(
+        (getattr(enum, n) for n in _READ_NAMES if hasattr(enum, n)), None
+    )
+    if write_op is None or read_op is None:
+        members = [n for n in dir(enum) if not n.startswith("_")]
+        raise AttributeError(
+            f"TransferOpcode members {members} match no known WRITE/READ "
+            f"spelling (tried write={_WRITE_NAMES}, read={_READ_NAMES})"
+        )
+    return write_op, read_op
+
+
 def _build_addr_list(buffer_ptr: int, buffer_size: int, page_size: int) -> list[int]:
     """Page-start addresses inside a registered buffer (used to map a
     MemoryObj's (data_ptr, page index) pair to a local transfer address)."""
@@ -194,6 +230,7 @@ class MooncakeChannel(BaseMultiBufferChannel):
     def _register_buffers(self, buffers: list[BufferConfig]) -> None:
         mooncake = _load_mooncake()
         self._mooncake = mooncake
+        self._opcode_write, self._opcode_read = _resolve_opcodes(mooncake)
 
         self.engine = mooncake.TransferEngine()
         ip = get_ip()
@@ -492,7 +529,7 @@ class MooncakeChannel(BaseMultiBufferChannel):
                 local_addrs,
                 remote_addrs,
                 lengths,
-                self._mooncake.TransferOpcode.WRITE,
+                self._opcode_write,
             ),
             f"batched_write to {target} ({len(objects)} pages)",
         )
@@ -513,7 +550,7 @@ class MooncakeChannel(BaseMultiBufferChannel):
                 local_addrs,
                 remote_addrs,
                 lengths,
-                self._mooncake.TransferOpcode.READ,
+                self._opcode_read,
             ),
             f"batched_read from {target} ({len(buffers)} pages)",
         )

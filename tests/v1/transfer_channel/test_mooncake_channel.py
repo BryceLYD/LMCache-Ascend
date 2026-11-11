@@ -26,6 +26,7 @@ from lmcache_ascend.v1.transfer_channel.mooncake_channel import (
     MooncakeChannel,
     _check_status,
     _load_mooncake,
+    _resolve_opcodes,
 )
 
 PAGE = 1024
@@ -379,6 +380,43 @@ def test_async_batched_read_delegates_to_sync(fake_mooncake, monkeypatch):
     finally:
         chan_a.close()
         chan_b.close()
+
+
+def test_opcode_prefix_spelling_resolves(monkeypatch):
+    """Repackaged NPU builds may spell the enum members OP_WRITE/OP_READ;
+    the channel must resolve either spelling and pass the right value."""
+    class _PrefixedOpcode:
+        OP_WRITE = "OP_W"
+        OP_READ = "OP_R"
+
+    fake = types.SimpleNamespace(
+        TransferEngine=FakeMooncakeEngine, TransferOpcode=_PrefixedOpcode
+    )
+    monkeypatch.setitem(sys.modules, "mooncake", fake)
+    _patch_npu(monkeypatch)
+    chan_a = _make_channel(peer_init_url=f"127.0.0.1:{_free_port()}")
+    chan_b = _make_channel(peer_init_url=f"127.0.0.1:{_free_port()}")
+    _wait_server_ready(chan_b)
+    try:
+        chan_a.lazy_init_peer_connection(
+            local_id="A", peer_id="B", peer_init_url=chan_b.peer_init_url
+        )
+        chan_a.batched_write([_FakeMemObj(BUF_A, 0)], _transfer_spec(chan_b))
+        assert chan_a.engine.transfers[0][4] == "OP_W"
+        chan_a.batched_read([_FakeMemObj(BUF_A, 1)], _transfer_spec(chan_b))
+        assert chan_a.engine.transfers[1][4] == "OP_R"
+    finally:
+        chan_a.close()
+        chan_b.close()
+
+
+def test_resolve_opcodes_unknown_spelling_lists_members():
+    class _WeirdOpcode:
+        kWrite = 1
+
+    fake = types.SimpleNamespace(TransferOpcode=_WeirdOpcode)
+    with pytest.raises(AttributeError, match="match no known"):
+        _resolve_opcodes(fake)
 
 
 def test_async_batched_write_raises(fake_mooncake, monkeypatch):
