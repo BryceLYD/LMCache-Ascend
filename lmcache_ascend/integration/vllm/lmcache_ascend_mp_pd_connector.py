@@ -163,7 +163,10 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
     def register_kv_caches(self, kv_caches: dict):
         super().register_kv_caches(kv_caches)
         if self._pd_engine is not None:
-            self._pd_kv_caches = kv_caches
+            # vLLM hands a {layer: tensor} dict; the NPU connector expects
+            # the per-layer tensor list (the same conversion the
+            # in-process line performs in vllm_v1_adapter.py).
+            self._pd_kv_caches = list(kv_caches.values())
             self._pd_engine.assemble(kv_caches)
 
     def wait_for_save(self):
