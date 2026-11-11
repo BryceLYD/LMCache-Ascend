@@ -159,6 +159,12 @@ def _validate_transfer_timeouts() -> None:
 _WRITE_NAMES = ("WRITE", "OP_WRITE", "Write", "write")
 _READ_NAMES = ("READ", "OP_READ", "Read", "read")
 
+# No-op TransferNotify member spellings for the repackaged builds that
+# require a sixth batch_transfer_sync argument (the canonical wheel
+# takes only five and has no TransferNotify at all).
+_NOTIFY_NONE_NAMES = ("NONE", "None", "NOTIFY_NONE", "none")
+_NO_NOTIFY_ARG = object()
+
 
 def _resolve_opcodes(mod) -> tuple:
     """Resolve (write, read) opcode values from a mooncake API module.
@@ -187,6 +193,31 @@ def _resolve_opcodes(mod) -> tuple:
             f"spelling (tried write={_WRITE_NAMES}, read={_READ_NAMES})"
         )
     return write_op, read_op
+
+
+def _resolve_notify_arg(mod):
+    """Resolve the no-op TransferNotify argument for builds that require
+    it on batch_transfer_sync (repackaged NPU trees expose a trailing
+    notify parameter the canonical wheel does not have).
+
+    Returns the member to pass, or ``_NO_NOTIFY_ARG`` when the build has
+    no TransferNotify (five-argument canonical layout). PD push/pull does
+    its completion signaling through the proxy protocol, so a no-op
+    notify is the right choice either way.
+    """
+    notify = getattr(mod, "TransferNotify", None)
+    if notify is None:
+        return _NO_NOTIFY_ARG
+    for name in _NOTIFY_NONE_NAMES:
+        member = getattr(notify, name, None)
+        if member is not None:
+            return member
+    members = [n for n in dir(notify) if not n.startswith("_")]
+    raise AttributeError(
+        f"TransferNotify members {members} match no known no-op "
+        f"spelling (tried {_NOTIFY_NONE_NAMES}); refusing to guess a "
+        "notify mode — a wrong mode would misreport completions"
+    )
 
 
 def _build_addr_list(buffer_ptr: int, buffer_size: int, page_size: int) -> list[int]:
@@ -231,6 +262,7 @@ class MooncakeChannel(BaseMultiBufferChannel):
         mooncake = _load_mooncake()
         self._mooncake = mooncake
         self._opcode_write, self._opcode_read = _resolve_opcodes(mooncake)
+        self._notify_arg = _resolve_notify_arg(mooncake)
 
         self.engine = mooncake.TransferEngine()
         ip = get_ip()
@@ -514,6 +546,23 @@ class MooncakeChannel(BaseMultiBufferChannel):
         lengths = [self.page_size] * len(items)
         return target, local_addrs, remote_addrs, lengths
 
+    def _batch_transfer_sync(
+        self,
+        target: str,
+        local_addrs: List[int],
+        remote_addrs: List[int],
+        lengths: List[int],
+        opcode,
+        what: str,
+    ) -> None:
+        """Layout-adaptive batch_transfer_sync: the repackaged NPU build
+        requires a trailing TransferNotify argument, the canonical wheel
+        does not."""
+        args = [target, local_addrs, remote_addrs, lengths, opcode]
+        if self._notify_arg is not _NO_NOTIFY_ARG:
+            args.append(self._notify_arg)
+        _check_status(self.engine.batch_transfer_sync(*args), what)
+
     def batched_write(
         self,
         objects: Union[list[bytes], list[MemoryObj]],
@@ -523,14 +572,12 @@ class MooncakeChannel(BaseMultiBufferChannel):
         target, local_addrs, remote_addrs, lengths = self._build_transfer_args(
             objects, transfer_spec
         )
-        _check_status(
-            self.engine.batch_transfer_sync(
-                target,
-                local_addrs,
-                remote_addrs,
-                lengths,
-                self._opcode_write,
-            ),
+        self._batch_transfer_sync(
+            target,
+            local_addrs,
+            remote_addrs,
+            lengths,
+            self._opcode_write,
             f"batched_write to {target} ({len(objects)} pages)",
         )
         return len(objects)
@@ -544,14 +591,12 @@ class MooncakeChannel(BaseMultiBufferChannel):
         target, local_addrs, remote_addrs, lengths = self._build_transfer_args(
             buffers, transfer_spec
         )
-        _check_status(
-            self.engine.batch_transfer_sync(
-                target,
-                local_addrs,
-                remote_addrs,
-                lengths,
-                self._opcode_read,
-            ),
+        self._batch_transfer_sync(
+            target,
+            local_addrs,
+            remote_addrs,
+            lengths,
+            self._opcode_read,
             f"batched_read from {target} ({len(buffers)} pages)",
         )
         return len(buffers)

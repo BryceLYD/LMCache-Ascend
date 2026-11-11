@@ -50,6 +50,7 @@ class FakeMooncakeEngine:
         self.registered = []
         self.unregistered = []
         self.transfers = []
+        self.notify_args = []
         self.fail_status = 0
         FakeMooncakeEngine.instances.append(self)
 
@@ -73,7 +74,8 @@ class FakeMooncakeEngine:
         return 0
 
     def batch_transfer_sync(
-        self, target_hostname, buffers, peer_buffer_addresses, lengths, opcode
+        self, target_hostname, buffers, peer_buffer_addresses, lengths, opcode,
+        notify=None,
     ):
         self.transfers.append(
             (
@@ -84,6 +86,7 @@ class FakeMooncakeEngine:
                 opcode,
             )
         )
+        self.notify_args.append(notify)
         return self.fail_status
 
 
@@ -417,6 +420,48 @@ def test_resolve_opcodes_unknown_spelling_lists_members():
     fake = types.SimpleNamespace(TransferOpcode=_WeirdOpcode)
     with pytest.raises(AttributeError, match="match no known"):
         _resolve_opcodes(fake)
+
+
+def test_notify_argument_layout(monkeypatch):
+    """The repackaged build requires a trailing TransferNotify argument;
+    the canonical layout (no TransferNotify) keeps the 5-arg call."""
+    class _Notify:
+        NONE = "no-notify"
+
+    fake = types.SimpleNamespace(
+        TransferEngine=FakeMooncakeEngine,
+        TransferOpcode=_FakeTransferOpcode,
+        TransferNotify=_Notify,
+    )
+    monkeypatch.setitem(sys.modules, "mooncake", fake)
+    _patch_npu(monkeypatch)
+    chan_a = _make_channel(peer_init_url=f"127.0.0.1:{_free_port()}")
+    chan_b = _make_channel(peer_init_url=f"127.0.0.1:{_free_port()}")
+    _wait_server_ready(chan_b)
+    try:
+        chan_a.lazy_init_peer_connection(
+            local_id="A", peer_id="B", peer_init_url=chan_b.peer_init_url
+        )
+        chan_a.batched_write([_FakeMemObj(BUF_A, 0)], _transfer_spec(chan_b))
+        assert chan_a.engine.notify_args == ["no-notify"]
+    finally:
+        chan_a.close()
+        chan_b.close()
+
+
+def test_canonical_layout_keeps_five_arg_call(fake_mooncake, monkeypatch):
+    """The fixture module has no TransferNotify: the call must stay
+    five-argument (notify recorded as None)."""
+    chan_a, chan_b = _make_peer_pair(fake_mooncake, monkeypatch)
+    try:
+        chan_a.lazy_init_peer_connection(
+            local_id="A", peer_id="B", peer_init_url=chan_b.peer_init_url
+        )
+        chan_a.batched_write([_FakeMemObj(BUF_A, 0)], _transfer_spec(chan_b))
+        assert chan_a.engine.notify_args == [None]
+    finally:
+        chan_a.close()
+        chan_b.close()
 
 
 def test_async_batched_write_raises(fake_mooncake, monkeypatch):
