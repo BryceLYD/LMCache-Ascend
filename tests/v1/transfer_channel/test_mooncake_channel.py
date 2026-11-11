@@ -464,6 +464,38 @@ def test_canonical_layout_keeps_five_arg_call(fake_mooncake, monkeypatch):
         chan_b.close()
 
 
+def test_notify_struct_layout_default_instance(monkeypatch):
+    """The vllm-ascend repackaged tree ships TransferNotify as a struct
+    (msg/name fields, no enum members): the no-op is a default-constructed
+    instance passed as the sixth argument."""
+    class _NotifyStruct:
+        def __init__(self):
+            self.msg = ""
+            self.name = ""
+
+    fake = types.SimpleNamespace(
+        TransferEngine=FakeMooncakeEngine,
+        TransferOpcode=_FakeTransferOpcode,
+        TransferNotify=_NotifyStruct,
+    )
+    monkeypatch.setitem(sys.modules, "mooncake", fake)
+    _patch_npu(monkeypatch)
+    chan_a = _make_channel(peer_init_url=f"127.0.0.1:{_free_port()}")
+    chan_b = _make_channel(peer_init_url=f"127.0.0.1:{_free_port()}")
+    _wait_server_ready(chan_b)
+    try:
+        chan_a.lazy_init_peer_connection(
+            local_id="A", peer_id="B", peer_init_url=chan_b.peer_init_url
+        )
+        chan_a.batched_write([_FakeMemObj(BUF_A, 0)], _transfer_spec(chan_b))
+        recorded = chan_a.engine.notify_args[0]
+        assert isinstance(recorded, _NotifyStruct)
+        assert recorded.msg == "" and recorded.name == ""
+    finally:
+        chan_a.close()
+        chan_b.close()
+
+
 def test_async_batched_write_raises(fake_mooncake, monkeypatch):
     """The upstream ABC declares async_batched_write abstract; the channel
     overrides it to stay instantiable but keeps the failure explicit, so

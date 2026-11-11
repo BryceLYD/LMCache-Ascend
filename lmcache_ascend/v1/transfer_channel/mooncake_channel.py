@@ -200,10 +200,13 @@ def _resolve_notify_arg(mod):
     it on batch_transfer_sync (repackaged NPU trees expose a trailing
     notify parameter the canonical wheel does not have).
 
-    Returns the member to pass, or ``_NO_NOTIFY_ARG`` when the build has
-    no TransferNotify (five-argument canonical layout). PD push/pull does
-    its completion signaling through the proxy protocol, so a no-op
-    notify is the right choice either way.
+    Two layouts exist: enum-style builds (no-op member NONE/None/...) and
+    class-style builds where TransferNotify is a struct with msg/name
+    fields — a default-constructed instance is the no-op either way:
+    an empty target sends nothing under input semantics, and the
+    container simply stays unfilled under output semantics. PD
+    completion signaling goes through the proxy protocol, so no-op is
+    correct either way.
     """
     notify = getattr(mod, "TransferNotify", None)
     if notify is None:
@@ -212,12 +215,15 @@ def _resolve_notify_arg(mod):
         member = getattr(notify, name, None)
         if member is not None:
             return member
-    members = [n for n in dir(notify) if not n.startswith("_")]
-    raise AttributeError(
-        f"TransferNotify members {members} match no known no-op "
-        f"spelling (tried {_NOTIFY_NONE_NAMES}); refusing to guess a "
-        "notify mode — a wrong mode would misreport completions"
-    )
+    try:
+        return notify()
+    except TypeError as e:
+        members = [n for n in dir(notify) if not n.startswith("_")]
+        raise AttributeError(
+            f"TransferNotify is neither a no-op enum (members {members}) "
+            f"nor default-constructible ({e}); inspect how the installed "
+            "stack builds TransferNotify and adapt"
+        ) from e
 
 
 def _build_addr_list(buffer_ptr: int, buffer_size: int, page_size: int) -> list[int]:
