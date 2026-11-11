@@ -25,6 +25,7 @@ from lmcache_ascend.v1.transfer_channel.buffer_config import BufferConfig, Buffe
 from lmcache_ascend.v1.transfer_channel.mooncake_channel import (
     MooncakeChannel,
     _check_status,
+    _load_mooncake,
 )
 
 PAGE = 1024
@@ -171,6 +172,27 @@ def test_check_status_variants():
     _check_status(True, "x")
     with pytest.raises(RuntimeError, match="failed with status 3"):
         _check_status(3, "x")
+
+
+def test_load_mooncake_resolves_transfer_engine_submodule(monkeypatch):
+    """Canonical mooncake-transfer-engine layout: TransferEngine lives in
+    the mooncake.transfer_engine submodule, not at the package top."""
+    top = types.ModuleType("mooncake")
+    te = types.SimpleNamespace(
+        TransferEngine=FakeMooncakeEngine, TransferOpcode=_FakeTransferOpcode
+    )
+    monkeypatch.setitem(sys.modules, "mooncake", top)
+    monkeypatch.setitem(sys.modules, "mooncake.transfer_engine", te)
+    assert _load_mooncake() is te
+
+
+def test_load_mooncake_error_lists_visible_symbols(monkeypatch):
+    """A mooncake package without the transfer-engine API must fail with
+    actionable diagnostics (origin + visible symbols)."""
+    top = types.ModuleType("mooncake")
+    monkeypatch.setitem(sys.modules, "mooncake", top)
+    with pytest.raises(ImportError, match="transfer-engine API"):
+        _load_mooncake()
 
 
 # ---------------------------------------------------------------------------

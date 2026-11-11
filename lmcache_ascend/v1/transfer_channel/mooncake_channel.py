@@ -60,10 +60,16 @@ _ASCEND_TRANSFER_TIMEOUT_DEFAULT_MS = 10000.0
 
 
 def _load_mooncake():
-    """Import the mooncake package and validate the expected API surface.
+    """Import the mooncake package and locate the transfer-engine API.
 
     Done lazily so that importing this module (and running unit tests
     with a fake mooncake module) does not require the real package.
+
+    Depending on the installed version, ``TransferEngine`` /
+    ``TransferOpcode`` live in the ``mooncake.transfer_engine``
+    submodule (the canonical layout of mooncake-transfer-engine) or at
+    the package top level. Returns the module object that provides
+    both symbols.
     """
     try:
         # Third Party
@@ -75,17 +81,32 @@ def _load_mooncake():
             "-DUSE_ASCEND_DIRECT=ON for Ascend support)"
         ) from e
 
-    missing = [
-        name
-        for name in ("TransferEngine", "TransferOpcode")
-        if not hasattr(mooncake, name)
-    ]
-    if missing:
-        raise ImportError(
-            f"mooncake package is missing expected symbols: {missing}; "
-            "check the pinned mooncake version"
-        )
-    return mooncake
+    candidates = []
+    try:
+        # Third Party
+        import mooncake.transfer_engine as _te
+
+        candidates.append(_te)
+    except (ImportError, OSError):
+        pass
+    candidates.append(mooncake)
+
+    for mod in candidates:
+        if all(hasattr(mod, n) for n in ("TransferEngine", "TransferOpcode")):
+            return mod
+
+    origin = getattr(mooncake, "__file__", None) or "<namespace package>"
+    visible = {}
+    for mod in candidates:
+        names = [n for n in dir(mod) if not n.startswith("_")]
+        visible[mod.__name__] = names[:20] + (["..."] if len(names) > 20 else [])
+    raise ImportError(
+        "mooncake package found but the transfer-engine API "
+        "(TransferEngine/TransferOpcode) is missing. Inspected: "
+        f"{origin}; visible symbols: {visible}. Install/build "
+        "mooncake-transfer-engine (with -DUSE_ASCEND_DIRECT=ON for "
+        "Ascend) and make sure its mooncake package is the one imported."
+    )
 
 
 def _check_status(ret, what: str) -> None:
