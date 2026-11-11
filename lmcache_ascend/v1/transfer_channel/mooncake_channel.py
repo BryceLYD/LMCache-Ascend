@@ -16,6 +16,7 @@ async + host-staging surface, so it is not usable for P2P KV sharing.
 
 # Standard
 from typing import List, Optional, Union
+import importlib
 import os
 
 # Third Party
@@ -59,17 +60,25 @@ _MC_TRANSFER_TIMEOUT_DEFAULT_S = 30.0
 _ASCEND_TRANSFER_TIMEOUT_DEFAULT_MS = 10000.0
 
 
+# API locations seen in the wild: the canonical wheel exposes
+# ``TransferEngine``/``TransferOpcode`` in ``mooncake.transfer_engine``;
+# some vllm-ascend images ship a repackaged tree where the pybind module
+# is ``mooncake.engine`` (``engine.so``) and the standard wrapper is
+# absent.
+_MOONCAKE_API_MODULES = ("mooncake.transfer_engine", "mooncake.engine")
+
+
 def _load_mooncake():
     """Import the mooncake package and locate the transfer-engine API.
 
     Done lazily so that importing this module (and running unit tests
     with a fake mooncake module) does not require the real package.
 
-    Depending on the installed version, ``TransferEngine`` /
+    Depending on the installed layout, ``TransferEngine`` /
     ``TransferOpcode`` live in the ``mooncake.transfer_engine``
-    submodule (the canonical layout of mooncake-transfer-engine) or at
-    the package top level. Returns the module object that provides
-    both symbols.
+    submodule (canonical), in a repackaged ``mooncake.engine`` pybind
+    module, or at the package top level. Returns the module object
+    that provides both symbols.
     """
     try:
         # Third Party
@@ -82,13 +91,11 @@ def _load_mooncake():
         ) from e
 
     candidates = []
-    try:
-        # Third Party
-        import mooncake.transfer_engine as _te
-
-        candidates.append(_te)
-    except (ImportError, OSError):
-        pass
+    for module_name in _MOONCAKE_API_MODULES:
+        try:
+            candidates.append(importlib.import_module(module_name))
+        except (ImportError, OSError):
+            pass
     candidates.append(mooncake)
 
     for mod in candidates:

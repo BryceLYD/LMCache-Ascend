@@ -186,6 +186,18 @@ def test_load_mooncake_resolves_transfer_engine_submodule(monkeypatch):
     assert _load_mooncake() is te
 
 
+def test_load_mooncake_resolves_repackaged_engine_module(monkeypatch):
+    """vllm-ascend images ship a repackaged tree where the pybind module
+    is mooncake.engine (engine.so) without transfer_engine.py."""
+    top = types.ModuleType("mooncake")
+    eng = types.SimpleNamespace(
+        TransferEngine=FakeMooncakeEngine, TransferOpcode=_FakeTransferOpcode
+    )
+    monkeypatch.setitem(sys.modules, "mooncake", top)
+    monkeypatch.setitem(sys.modules, "mooncake.engine", eng)
+    assert _load_mooncake() is eng
+
+
 def test_load_mooncake_error_lists_visible_symbols(monkeypatch):
     """A mooncake package without the transfer-engine API must fail with
     actionable diagnostics (origin + visible symbols)."""
