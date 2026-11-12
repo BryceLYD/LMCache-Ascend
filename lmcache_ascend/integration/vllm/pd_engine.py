@@ -128,13 +128,6 @@ class MPPDWorkerMetadata(LMCacheMPWorkerMetadata):
             completed_store_requests=merged.completed_store_requests,
             failed_store_requests=merged.failed_store_requests,
         )
-        # kv_events exists only on the in-process-era upstream metadata;
-        # the dev-branch LMCacheMPWorkerMetadata dropped the field, so
-        # relay it as an optional attribute instead of a constructor
-        # kwarg.
-        kv_events = getattr(merged, "kv_events", None)
-        if kv_events is not None:
-            out.kv_events = kv_events
         out.pd_received.update(self.pd_received)
         out.pd_received.update(getattr(other, "pd_received", {}))
         out.pd_arrived_keys = self.pd_arrived_keys + getattr(

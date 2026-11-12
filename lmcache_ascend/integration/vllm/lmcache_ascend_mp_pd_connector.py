@@ -339,13 +339,6 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             completed_store_requests=base.completed_store_requests,
             failed_store_requests=base.failed_store_requests,
         )
-        # kv_events exists only on the in-process-era upstream metadata;
-        # the dev-branch LMCacheMPWorkerMetadata dropped the field, so
-        # relay it as an optional attribute instead of a constructor
-        # kwarg.
-        kv_events = getattr(base, "kv_events", None)
-        if kv_events is not None:
-            out.kv_events = kv_events
         out.pd_received = self._pd_received
         out.pd_arrived_keys = self._pd_arrived_pending
         self._pd_received = {}
