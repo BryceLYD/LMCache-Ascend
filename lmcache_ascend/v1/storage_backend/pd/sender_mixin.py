@@ -327,14 +327,31 @@ class AscendPDSenderMixin:
                 # premature free and PagedTensorMemoryAllocator
                 # double-free corruption.
                 if transfer_spec.is_last_prefill:
-                    notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-                    self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+                    self.send_proxy_notification(transfer_spec.req_id)
                 return
 
         if self.pull_mode:
             self._batched_submit_put_task_pull(keys, memory_objs, transfer_spec)
         else:
             self._batched_submit_put_task_push(keys, memory_objs, transfer_spec)
+
+    def send_proxy_notification(self, req_id: str) -> None:
+        """Send the last-prefill notification to the disagg proxy.
+
+        This opens the gate the proxy waits on before forwarding the
+        decode request; it must fire whenever prefill is over, whether
+        chunks were shipped, skipped (producer L1 hit), or failed.
+        """
+        if self.proxy_side_channel is None:
+            logger.warning(
+                "No proxy side channel configured; skipping notification "
+                "for req %s",
+                req_id,
+            )
+            return
+        notif_msg = ProxyNotif(req_id=req_id)
+        self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+
 
     def _batched_submit_put_task_push(
         self,
@@ -377,8 +394,7 @@ class AscendPDSenderMixin:
                     time.monotonic() + self._peer_alloc_backoff_ttl
                 )
             if transfer_spec.is_last_prefill:
-                notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-                self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+                self.send_proxy_notification(transfer_spec.req_id)
             return
 
         already_sent_indexes = set(alloc_response.already_sent_indexes)
@@ -419,8 +435,7 @@ class AscendPDSenderMixin:
             )
 
         if transfer_spec.is_last_prefill:
-            notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-            self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+            self.send_proxy_notification(transfer_spec.req_id)
 
     def _batched_submit_put_task_pull(
         self,
@@ -513,8 +528,7 @@ class AscendPDSenderMixin:
                     time.monotonic() + self._peer_alloc_backoff_ttl
                 )
             if transfer_spec.is_last_prefill:
-                notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-                self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+                self.send_proxy_notification(transfer_spec.req_id)
             return
 
         # Release already-sent objects, pin the rest
@@ -574,5 +588,4 @@ class AscendPDSenderMixin:
             )
 
         if transfer_spec.is_last_prefill:
-            notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-            self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+            self.send_proxy_notification(transfer_spec.req_id)

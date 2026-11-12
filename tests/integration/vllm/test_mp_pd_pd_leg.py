@@ -15,7 +15,7 @@ machine, not here.
 
 # Standard
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import importlib
 
 # Third Party
@@ -287,6 +287,108 @@ def test_send_instructions_skip_multi_group():
     tracker.num_scheduled_tokens = 700
     tracker.allocated_block_ids = {0: [1, 2], 1: [3, 4]}
     assert connector._pd_build_send_instructions() == []
+
+
+def test_send_instructions_cover_l1_hit_prefix():
+    """The shipment covers the L1-loaded prefix too (it lives in the
+    paged pool just like computed tokens) — otherwise a producer-side
+    L1 hit leaves the decoder with a recompute hole."""
+    connector, _ = _make_scheduler_connector(lookup_results=(768,))
+    request = _fake_request("hole", 917)
+    connector.request_trackers["hole"] = _real_tracker(request)
+    connector.update_state_after_alloc(request, _blocks_ns(), 0)
+    tracker = connector.request_trackers["hole"]
+    tracker.num_lmcache_hit_tokens = 768
+    tracker.allocated_block_ids = {0: list(range(8))}
+
+    tracker.num_scheduled_tokens = 100
+    instrs = connector._pd_build_send_instructions()
+    assert len(instrs) == 1
+    assert (instrs[0].start, instrs[0].end) == (0, 768)
+    assert instrs[0].is_last_prefill is False
+
+    tracker.num_scheduled_tokens = 149
+    instrs = connector._pd_build_send_instructions()
+    assert len(instrs) == 1
+    assert (instrs[0].start, instrs[0].end) == (768, 917)
+    assert instrs[0].is_last_prefill is True
+    assert connector._pd_specs["hole"].last_notified is True
+
+
+def test_send_instructions_notify_only_when_nothing_left_to_ship():
+    """Prefill done, everything already shipped, gate never opened:
+    a notify-only instruction must still be emitted (exactly once) so
+    the disagg proxy lets the decode request through."""
+    connector, _ = _make_scheduler_connector()
+    request = _fake_request("gate", 700)
+    connector.request_trackers["gate"] = _real_tracker(request)
+    connector.update_state_after_alloc(request, _blocks_ns(), 0)
+    tracker = connector.request_trackers["gate"]
+    tracker.num_scheduled_tokens = 700
+    spec = connector._pd_specs["gate"]
+    spec.sent_end = 700
+
+    instrs = connector._pd_build_send_instructions()
+    assert len(instrs) == 1
+    assert instrs[0].notify_only is True
+    assert instrs[0].is_last_prefill is True
+    assert spec.last_notified is True
+    assert connector._pd_build_send_instructions() == []
+
+
+def _pd_instr(stack, req_id="r1", is_last=False, notify_only=False):
+    return stack.pd_engine_mod.PDSendInstruction(
+        req_id=req_id,
+        receiver_host="h",
+        receiver_init_port=[7300],
+        receiver_alloc_port=[7400],
+        token_ids=[1],
+        block_ids=[],
+        block_size=16,
+        start=0,
+        end=256,
+        is_last_prefill=is_last,
+        notify_only=notify_only,
+    )
+
+
+def test_execute_send_instructions_notify_only_opens_gate():
+    connector, stack = _make_scheduler_connector()
+    connector._pd_engine = MagicMock()
+    connector._pd_kv_caches = []
+    instr = _pd_instr(stack, notify_only=True, is_last=True)
+    connector._pd_execute_send_instructions(
+        SimpleNamespace(pd_send_instructions=[instr])
+    )
+    connector._pd_engine.send_proxy_notification.assert_called_once_with("r1")
+    connector._pd_engine.execute_send.assert_not_called()
+
+
+def test_execute_send_instructions_failure_opens_gate():
+    """A failed last-chunk shipment must still open the proxy gate: the
+    decoder recomputes the missing range, but it can only start once
+    the notification arrives."""
+    connector, stack = _make_scheduler_connector()
+    connector._pd_engine = MagicMock()
+    connector._pd_engine.execute_send.side_effect = RuntimeError("boom")
+    connector._pd_kv_caches = []
+    instr = _pd_instr(stack, is_last=True)
+    connector._pd_execute_send_instructions(
+        SimpleNamespace(pd_send_instructions=[instr])
+    )
+    connector._pd_engine.send_proxy_notification.assert_called_once_with("r1")
+
+
+def test_execute_send_instructions_mid_failure_keeps_gate():
+    connector, stack = _make_scheduler_connector()
+    connector._pd_engine = MagicMock()
+    connector._pd_engine.execute_send.side_effect = RuntimeError("boom")
+    connector._pd_kv_caches = []
+    instr = _pd_instr(stack, is_last=False)
+    connector._pd_execute_send_instructions(
+        SimpleNamespace(pd_send_instructions=[instr])
+    )
+    connector._pd_engine.send_proxy_notification.assert_not_called()
 
 
 def test_worker_metadata_aggregate_merges_pd_received():

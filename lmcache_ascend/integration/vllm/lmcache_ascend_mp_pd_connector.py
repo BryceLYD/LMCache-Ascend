@@ -177,9 +177,14 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             self._pd_restore_l1_stores()
         if self._pd_engine is None or self._pd_kv_caches is None:
             return
-        metadata = self._get_connector_metadata()
+        self._pd_execute_send_instructions(self._get_connector_metadata())
+
+    def _pd_execute_send_instructions(self, metadata) -> None:
         for instr in getattr(metadata, "pd_send_instructions", None) or []:
             try:
+                if getattr(instr, "notify_only", False):
+                    self._pd_engine.send_proxy_notification(instr.req_id)
+                    continue
                 self._pd_engine.execute_send(instr, self._pd_kv_caches)
             except Exception:
                 logger.exception(
@@ -189,6 +194,19 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     instr.start,
                     instr.end,
                 )
+                if instr.is_last_prefill:
+                    # The proxy gates the decode request on this
+                    # notification; without it the client would hang even
+                    # though the receiver would have recomputed the
+                    # missing range. Open the gate no matter what.
+                    try:
+                        self._pd_engine.send_proxy_notification(instr.req_id)
+                    except Exception:
+                        logger.exception(
+                            "Proxy notification for req %s failed; the "
+                            "disagg proxy will keep waiting.",
+                            instr.req_id,
+                        )
 
     def _pd_maybe_suppress_l1_stores(self) -> None:
         """pd_only policy: skip the L1 store for PD-routed requests.
@@ -474,11 +492,16 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
     def _pd_build_send_instructions(self) -> list:
         """Compute this step's PD send ranges (发货单 execution orders).
 
-        For every request with a delivery spec whose computed tokens
-        advanced: send the newly computed chunk-aligned prefix (plus the
-        unfull tail on the final prefill step, when save_unfull_chunk is
-        on) and mark the last instruction so the sender notifies the
-        disagg proxy.
+        The covered reach is the L1-loaded prefix plus the newly
+        computed tokens (both live in the paged pool, so both can be
+        shipped): without the L1 part, a producer-side cache hit would
+        leave the decoder with a hole it can only fill by recomputing.
+
+        When the prefill phase is over but nothing is left to ship
+        (e.g. everything was already sent), a notify-only instruction
+        is emitted so the proxy gate still opens; without it the client
+        would hang forever even though the decoder would have
+        recomputed the missing range.
         """
         if not self._pd_specs:
             return []
@@ -487,18 +510,43 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         trackers = getattr(self, "request_trackers", None) or {}
         chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
         block_size = self._vllm_config.cache_config.block_size
+
+        def _notify_only(spec, tracker, block_size):
+            return PDSendInstruction(
+                req_id=spec.req_id,
+                receiver_host=spec.receiver_host,
+                receiver_init_port=spec.receiver_init_port,
+                receiver_alloc_port=spec.receiver_alloc_port,
+                token_ids=tracker.get_token_ids(),
+                block_ids=[],
+                block_size=block_size,
+                start=spec.sent_end,
+                end=spec.sent_end,
+                is_last_prefill=True,
+                notify_only=True,
+            )
+
         instructions: list = []
         for req_id, spec in list(self._pd_specs.items()):
             tracker = trackers.get(req_id)
             if tracker is None:
                 continue
-            computed = min(
-                tracker.num_scheduled_tokens, spec.num_prompt_tokens
+            handled = min(
+                tracker.num_lmcache_hit_tokens + tracker.num_scheduled_tokens,
+                spec.num_prompt_tokens,
             )
-            if computed <= spec.sent_end:
+            if handled <= spec.sent_end:
+                if (
+                    handled >= spec.num_prompt_tokens
+                    and not spec.last_notified
+                ):
+                    instructions.append(
+                        _notify_only(spec, tracker, block_size)
+                    )
+                    spec.last_notified = True
                 continue
-            if computed < spec.num_prompt_tokens:
-                end = computed // chunk * chunk
+            if handled < spec.num_prompt_tokens:
+                end = handled // chunk * chunk
             else:
                 end = spec.num_prompt_tokens
             block_ids = self._flatten_single_group_block_ids(
@@ -511,10 +559,27 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     req_id,
                     len(tracker.allocated_block_ids),
                 )
+                if (
+                    handled >= spec.num_prompt_tokens
+                    and not spec.last_notified
+                ):
+                    instructions.append(
+                        _notify_only(spec, tracker, block_size)
+                    )
+                    spec.last_notified = True
                 continue
             end = min(end, len(block_ids) * block_size)
             if end <= spec.sent_end:
+                if (
+                    handled >= spec.num_prompt_tokens
+                    and not spec.last_notified
+                ):
+                    instructions.append(
+                        _notify_only(spec, tracker, block_size)
+                    )
+                    spec.last_notified = True
                 continue
+            is_last = end >= spec.num_prompt_tokens
             instructions.append(
                 PDSendInstruction(
                     req_id=spec.req_id,
@@ -526,10 +591,12 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     block_size=block_size,
                     start=spec.sent_end,
                     end=end,
-                    is_last_prefill=end >= spec.num_prompt_tokens,
+                    is_last_prefill=is_last,
                 )
             )
             spec.sent_end = end
+            if is_last:
+                spec.last_notified = True
         return instructions
 
     @staticmethod

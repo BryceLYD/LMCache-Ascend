@@ -74,6 +74,7 @@ class PDTransferSpec:
     receiver_alloc_port: list
     num_prompt_tokens: int
     sent_end: int = 0
+    last_notified: bool = False
 
 
 @dataclass
@@ -95,6 +96,12 @@ class PDSendInstruction:
     start: int
     end: int
     is_last_prefill: bool = False
+
+    # Gate-key-only order: the prefill phase is over but no chunk is
+    # being shipped (e.g. the producer L1-hit the whole prompt); the
+    # worker only sends the proxy notification so the decode side is
+    # never left waiting on a transfer that will not happen.
+    notify_only: bool = False
 
 
 @dataclass
@@ -472,6 +479,22 @@ class PDEngine:
                 result,
             )
         self.backend.batched_submit_put_task(keys, objs, transfer_spec=instr)
+
+    def send_proxy_notification(self, req_id: str) -> None:
+        """Open the disagg proxy gate for a request.
+
+        The proxy blocks the decode request until this notification
+        arrives; it must be sent whenever the prefill phase is over,
+        regardless of whether any chunk was shipped or whether the
+        shipment failed — the decoder recomputes whatever did not
+        arrive, but it can only start once the gate opens.
+        """
+        if self.backend is None:
+            logger.error(
+                "PD engine not assembled; cannot notify proxy for %s", req_id
+            )
+            return
+        self.backend.send_proxy_notification(req_id)
 
     # ------------------------------------------------------------------
     # Receiver (D side)
