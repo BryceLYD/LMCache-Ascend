@@ -464,9 +464,13 @@ class PDEngine:
             kvcaches=kvcaches,
             slot_mapping=slot_mapping,
         )
-        if result is not None:
-            for _ in result:
-                pass
+        if isinstance(result, float):
+            logger.debug(
+                "PD copy-out for req %s: %d chunks in %.3fs",
+                instr.req_id,
+                len(objs),
+                result,
+            )
         self.backend.batched_submit_put_task(keys, objs, transfer_spec=instr)
 
     # ------------------------------------------------------------------
