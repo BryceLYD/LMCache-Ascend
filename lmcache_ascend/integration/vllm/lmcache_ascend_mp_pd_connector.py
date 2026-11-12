@@ -548,10 +548,13 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         skip) and counts consecutive arrived chunks; the ledger's
         ``pd_tokens`` is then this union end, which makes the PD_IN
         segment exactly the arrived range beyond L1.
+
+        Spec-free by design: the disagg proxy strips
+        ``kv_transfer_params`` from the decode request, so arrivals are
+        matched by content — the chunk keys derived from this request's
+        own tokens are exactly the keys the producer transferred.
         """
-        if self._pd_key_db is None or request.request_id not in (
-            self._pd_specs
-        ):
+        if self._pd_key_db is None:
             return 0
         token_ids = request.all_token_ids
         chunk = self._pd_chunk_size
@@ -576,17 +579,18 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         the L1 reach, using the tracker's allocated blocks. A chunk that
         went missing by load time surfaces as a load error and vLLM
         recomputes it, so no retry is issued here.
+
+        Spec-free by design (see ``_pd_union_prefix``): the decode
+        request never carries ``disagg_spec`` — ledgers with a PD_IN
+        segment are the driver.
         """
-        if self._pd_key_db is None or not self._pd_specs:
+        if self._pd_key_db is None:
             return []
         trackers = getattr(self, "request_trackers", None) or {}
         block_size = self._vllm_config.cache_config.block_size
         instructions: list = []
-        for req_id, spec in self._pd_specs.items():
+        for req_id, ledger in self._ledgers.items():
             if req_id in self._pd_load_issued:
-                continue
-            ledger = self._ledgers.get(req_id)
-            if ledger is None:
                 continue
             segments = ledger.pd_receive_segments()
             if not segments:
@@ -605,7 +609,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 continue
             instructions.append(
                 PDLoadInstruction(
-                    request_id=spec.req_id,
+                    request_id=req_id,
                     token_ids=tracker.get_token_ids(),
                     block_ids=block_ids,
                     block_size=block_size,

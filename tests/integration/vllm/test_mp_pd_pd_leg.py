@@ -389,12 +389,18 @@ def test_merged_lookup_pending_passes_none_through():
     assert result[0] is None
 
 
-def test_merged_lookup_ignores_arrived_without_spec():
-    connector, _ = _make_scheduler_connector(lookup_results=(0,))
+def test_merged_lookup_matches_arrived_without_spec():
+    """The disagg proxy strips kv_transfer_params from decode requests,
+    so arrived chunks must match by content with no spec attached."""
+    connector, stack = _make_scheduler_connector(lookup_results=(0,))
     _enable_pd_merge(connector, {"key-0", "key-1", "key-2"})
     request = _fake_request("nospec", 700, with_spec=False)
-    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
-    assert not connector._ledgers["nospec"].pd_receive_segments()
+    assert connector.get_num_new_matched_tokens(request, 0) == (699, True)
+    ledger = connector._ledgers["nospec"]
+    kv = stack.kv_source
+    assert [(s.start, s.end, s.source) for s in ledger.segments] == [
+        (0, 700, kv.PD_IN)
+    ]
 
 
 def test_pd_build_load_instructions_once():
