@@ -167,6 +167,7 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         if self.pd_config.role == "sender":
             self._init_sender()
             self.initialized_peers: set[str] = set()
+            self._peer_init_lock = threading.Lock()
             self.mem_alloc_sockets: dict[str, zmq.Socket] = {}
         elif self.pd_config.role == "receiver":
             self._init_receiver()

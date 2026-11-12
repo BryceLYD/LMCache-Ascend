@@ -258,12 +258,43 @@ class AscendPDSenderMixin:
         receiver_init_port: int,
         receiver_alloc_port: int,
     ) -> None:
-        """Override to call parent and handle any Ascend-specific setup."""
-        super()._ensure_peer_connection(
-            receiver_id=receiver_id,
-            receiver_host=receiver_host,
-            receiver_init_port=receiver_init_port,
-            receiver_alloc_port=receiver_alloc_port,
+        """Ascend-native peer setup, replacing the upstream implementation.
+
+        The upstream ``PDBackend._ensure_peer_connection`` drives the
+        nixl-based transfer stack and assumes nixl internals this backend
+        never initializes. The Ascend backend uses its own transfer
+        channel plus a ZMQ alloc side-channel, so this method performs
+        both per-peer, idempotently:
+
+        1. transfer-channel handshake: exchange engine names and the
+           buffer layout tables with the receiver rank (mooncake needs
+           the peer's engine name ``ip:rpc_port`` and the buffer bases
+           for every ``batch_transfer_sync``),
+        2. the alloc side-channel socket the push/pull paths use to
+           request remote page allocation.
+        """
+        if receiver_id in self.initialized_peers:
+            return
+        with self._peer_init_lock:
+            if receiver_id in self.initialized_peers:
+                return
+            self.transfer_channel.lazy_init_peer_connection(
+                local_id=self.local_id,
+                peer_id=receiver_id,
+                peer_init_url=f"{receiver_host}:{receiver_init_port}",
+            )
+            self.mem_alloc_sockets[receiver_id] = get_zmq_socket(
+                self.zmq_context,
+                f"{receiver_host}:{receiver_alloc_port}",
+                "tcp",
+                zmq.REQ,
+                "connect",
+            )
+            self.initialized_peers.add(receiver_id)
+        logger.info(
+            "PD peer connection established: %s (channel handshake + "
+            "alloc socket)",
+            receiver_id,
         )
 
     def _remote_allocate(
