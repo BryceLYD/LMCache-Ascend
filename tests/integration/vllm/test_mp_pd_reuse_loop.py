@@ -480,10 +480,13 @@ def _receiver(stack, oracle, buffer_keys=()):
 
 
 def _alloc_msg(stack, keys, token_ids, token_start, pd_chunk=256):
+    # KV_2LTD shape is [2, num_layers, num_tokens, hidden_dim]: the
+    # token dim sits at index 2 (fmt=1 -> token_dim()==2), so the PD
+    # chunk size must land at shape[2] for the receiver to read it.
     return stack.messages_mod.AscendAllocRequest(
         keys=list(keys),
         fmt=1,
-        shape=[2, pd_chunk, 8, 128],
+        shape=[2, 8, pd_chunk, 128],
         dtype="bfloat16",
         last_chunk_toks=pd_chunk,
         token_ids=list(token_ids),
