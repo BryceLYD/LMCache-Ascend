@@ -123,7 +123,7 @@ def _make_scheduler_connector(lookup_results=(0,)):
     connector._pd_kv_caches = None
     connector._pd_arrived = set()
     connector._pd_key_db = None
-    connector._pd_chunk_size = 0
+    connector._pd_chunk_size = 256
     connector._pd_load_issued = set()
     connector._pd_load_done = set()
     connector._pd_failed_blocks = set()
@@ -350,6 +350,30 @@ def _pd_instr(stack, req_id="r1", is_last=False, notify_only=False):
         is_last_prefill=is_last,
         notify_only=notify_only,
     )
+
+
+def test_send_instructions_l1_only_still_opens_gate():
+    """l1_only ships nothing through PD, but the proxy gate must still
+    open once the prefill phase is over (the decoder recomputes)."""
+    connector, _ = _make_scheduler_connector()
+    connector._pd_save_policy = "l1_only"
+    request = _fake_request("l1only", 700)
+    connector.request_trackers["l1only"] = _real_tracker(request)
+    connector.update_state_after_alloc(request, _blocks_ns(), 0)
+    tracker = connector.request_trackers["l1only"]
+
+    # Mid-prefill: nothing shipped, gate stays closed.
+    tracker.num_scheduled_tokens = 300
+    assert connector._pd_build_send_instructions() == []
+
+    # Prefill over: the notify-only instruction opens the gate once.
+    tracker.num_scheduled_tokens = 700
+    instrs = connector._pd_build_send_instructions()
+    assert len(instrs) == 1
+    assert instrs[0].notify_only is True
+    assert instrs[0].is_last_prefill is True
+    assert connector._pd_specs["l1only"].last_notified is True
+    assert connector._pd_build_send_instructions() == []
 
 
 def test_execute_send_instructions_notify_only_opens_gate():

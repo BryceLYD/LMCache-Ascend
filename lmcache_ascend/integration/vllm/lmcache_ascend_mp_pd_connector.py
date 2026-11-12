@@ -497,18 +497,21 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         shipped): without the L1 part, a producer-side cache hit would
         leave the decoder with a hole it can only fill by recomputing.
 
-        When the prefill phase is over but nothing is left to ship
-        (e.g. everything was already sent), a notify-only instruction
-        is emitted so the proxy gate still opens; without it the client
-        would hang forever even though the decoder would have
-        recomputed the missing range.
+        ``l1_only`` ships nothing through PD, but the proxy gate must
+        still open once the prefill phase is over (the decoder
+        recomputes everything), so notify-only instructions are emitted
+        for it too. The same gate guarantee applies whenever the
+        prefill phase ends with nothing left to ship.
+
+        Ranges are aligned to the PD chunk size (the unit the chunk
+        keys and the token database are built from).
         """
         if not self._pd_specs:
             return []
-        if self._pd_save_policy == "l1_only":
-            return []
         trackers = getattr(self, "request_trackers", None) or {}
-        chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
+        chunk = self._pd_chunk_size or (
+            self.scheduler_adapter.lmcache_tokens_per_chunk
+        )
         block_size = self._vllm_config.cache_config.block_size
 
         def _notify_only(spec, tracker, block_size):
@@ -535,7 +538,8 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 tracker.num_lmcache_hit_tokens + tracker.num_scheduled_tokens,
                 spec.num_prompt_tokens,
             )
-            if handled <= spec.sent_end:
+            ship = self._pd_save_policy != "l1_only"
+            if handled <= spec.sent_end or not ship:
                 if (
                     handled >= spec.num_prompt_tokens
                     and not spec.last_notified
