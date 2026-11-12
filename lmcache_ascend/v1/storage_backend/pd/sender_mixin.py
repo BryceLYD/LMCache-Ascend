@@ -22,6 +22,7 @@ import zmq
 
 # First Party
 from lmcache_ascend.v1.storage_backend.pd.messages import (
+    AscendAllocRequest,
     AscendAllocResponse,
     AscendPDMsg,
     PullDoneSignal,
@@ -311,6 +312,50 @@ class AscendPDSenderMixin:
         )
         return alloc_response
 
+    def _get_remote_alloc_request(
+        self,
+        keys: Sequence[CacheEngineKey],
+        mem_objs: List[MemoryObj],
+        transfer_spec: Any = None,
+    ) -> AllocRequest:
+        """Build the alloc request, extended with token context.
+
+        Same layout fields as upstream (fmt / shape / dtype /
+        last_chunk_toks from the memory objects). When the transfer
+        spec carries the prompt tokens (the MP+PD connector's send
+        instructions do), the request becomes an ``AscendAllocRequest``
+        so the receiver can dedup against its own L1: the full token
+        ids (server chunk hashes are rolling from token 0) plus the
+        absolute token position of the first key's chunk. The first
+        key always starts exactly at ``spec.start`` because shipment
+        boundaries are PD-chunk aligned.
+        """
+        fmt = mem_objs[0].meta.fmt
+        shape = mem_objs[0].meta.shape
+        dtype = TORCH_DTYPE_TO_STR_DTYPE[mem_objs[0].meta.dtype]
+        token_dim = fmt.token_dim()
+        last_chunk_toks = mem_objs[-1].meta.shape[token_dim]
+        str_keys = [key.to_string() for key in keys]
+
+        token_ids = getattr(transfer_spec, "token_ids", None)
+        if token_ids:
+            return AscendAllocRequest(
+                keys=str_keys,
+                fmt=fmt.value,
+                shape=list(shape),
+                dtype=dtype,
+                last_chunk_toks=last_chunk_toks,
+                token_ids=list(token_ids),
+                token_start=int(getattr(transfer_spec, "start", 0)),
+            )
+        return AllocRequest(
+            keys=str_keys,
+            fmt=fmt.value,
+            shape=list(shape),
+            dtype=dtype,
+            last_chunk_toks=last_chunk_toks,
+        )
+
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
@@ -406,8 +451,13 @@ class AscendPDSenderMixin:
             receiver_alloc_port=receiver_alloc_port,
         )
 
-        # Remote allocation — returns UUID-based refs
-        alloc_request = self._get_remote_alloc_request(keys, memory_objs)
+        # Remote allocation — returns UUID-based refs. The request
+        # carries the prompt token ids + the absolute token position of
+        # the first chunk so the receiver can also dedup against its
+        # own L1 (server chunks are content-hashed from token 0).
+        alloc_request = self._get_remote_alloc_request(
+            keys, memory_objs, transfer_spec
+        )
         alloc_response = self._remote_allocate(receiver_id, alloc_request)
 
         if alloc_response.alloc_failed:
@@ -530,6 +580,8 @@ class AscendPDSenderMixin:
             shape=list(shape),
             dtype=dtype,
             last_chunk_toks=last_chunk_toks,
+            token_ids=list(getattr(transfer_spec, "token_ids", None) or []),
+            token_start=int(getattr(transfer_spec, "start", 0)),
         )
 
         # Send PullReadyNotif and receive ack.

@@ -32,8 +32,16 @@ Step status:
   ``pd_tokens``. Scheduling semantics are still upstream's: the PD
   observation is pure bookkeeping until the Step-5 merge, so D keeps
   recomputing what it has not loaded (correct, wasteful-by-design).
-* Step 5 will replace the scheduler-side lookup pipeline with the
+* Step 5 replaced the scheduler-side lookup pipeline with the
   ledger-driven APC -> L1 -> PD_IN merge and the mixed load path.
+* Step 6 (current) closes the reuse loop on the decoder:
+  ``pd_store_through`` persists the worker-confirmed PD-landed prefix
+  into the decoder's own LMCache server by injecting STORE-direction
+  request metadata into the upstream store flow (upstream itself never
+  stores from the consumer), and ``pd_alloc_check_l1`` extends the
+  receiver's alloc-time dedup from the receive buffer to the decoder's
+  L1 so a repeated prompt is not re-transmitted by the producer. Both
+  features fail open to the pre-Step-6 behavior.
 """
 
 # Standard
@@ -41,14 +49,21 @@ from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
 from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
-from lmcache.integration.vllm.lmcache_mp_metadata import LMCacheMPWorkerMetadata
+from lmcache.integration.vllm.lmcache_mp_metadata import (
+    LMCacheMPRequestMetadata,
+    LMCacheMPWorkerMetadata,
+)
+from lmcache.integration.vllm.vllm_multi_process_adapter import LoadStoreOp
+from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.logger import init_logger
 from vllm.v1.outputs import KVConnectorOutput
+import torch
 
 # First Party
 from lmcache_ascend.integration.vllm.pd_engine import (
+    L1QueryOracle,
     MPPDWorkerMetadata,
     PDEngine,
     PDLoadInstruction,
@@ -125,14 +140,32 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 f"{PDEngine.VALID_SAVE_POLICIES}, got "
                 f"{extra.get('pd_save_policy')!r}"
             )
+        # Step 6: decoder-side store-through (persist the PD-landed
+        # prefix into the decoder's own LMCache server) and the
+        # alloc-time L1 dedup (skip re-transmission of chunks the
+        # decoder can serve from its own L1). Both degrade to today's
+        # behavior when off or when their plumbing errors.
+        self._pd_store_through = bool(extra.get("pd_store_through", True))
+        self._pd_alloc_check_l1 = bool(extra.get("pd_alloc_check_l1", True))
+        # Must match the server fleet's hashing (the same key the MP
+        # adapters resolve; default "blake3" on both sides).
+        self._pd_l1_hash_algorithm = str(
+            extra.get("lmcache.mp.hash_algorithm", "blake3")
+        )
         # Step 5: scheduler-side PD union-walk state.
         self._pd_arrived: set = set()
         self._pd_key_db = None
         self._pd_chunk_size = 0
         self._pd_load_issued: set[str] = set()
+        # Step 6: scheduler-side confirmed-landed prefix per request
+        # (worker-reported; the store-through source of truth).
+        self._pd_landed: dict[str, int] = {}
         # Step 5: worker-side PD load completion / failure state.
         self._pd_load_done: set[str] = set()
         self._pd_failed_blocks: set[int] = set()
+        # Step 6: worker-side landed reports awaiting the next
+        # build_connector_worker_meta call.
+        self._pd_loaded_pending: dict[str, int] = {}
         if role == KVConnectorRole.SCHEDULER:
             kv_transfer_config = vllm_config.kv_transfer_config
             extra = (
@@ -168,6 +201,70 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             # in-process line performs in vllm_v1_adapter.py).
             self._pd_kv_caches = list(kv_caches.values())
             self._pd_engine.assemble(kv_caches)
+            self._pd_maybe_attach_l1_oracle()
+
+    def _pd_maybe_attach_l1_oracle(self) -> None:
+        """Build the L1 residency oracle and hand it to the PD backend.
+
+        Receiver (decoder) worker only: the alloc handler will dedup
+        incoming chunks against the decoder's OWN LMCache server, which
+        is the same server the scheduler-side lookup queries -- so an
+        alloc-time hit implies a scheduler lookup hit and the ledger
+        resolves the range to L1 (no transmission hole). Any wiring
+        failure just leaves the dedup at buffer level.
+        """
+        engine = self._pd_engine
+        if (
+            engine is None
+            or engine.pd_role != "receiver"
+            or not self._pd_alloc_check_l1
+        ):
+            return
+        adapter = getattr(self, "worker_adapter", None)
+        server_url = getattr(adapter, "_server_url", None)
+        mp_chunk = getattr(adapter, "lmcache_tokens_per_chunk", None)
+        if not server_url or not mp_chunk:
+            logger.warning(
+                "MP+PD: no MP server info on the worker adapter; the "
+                "alloc-time L1 dedup stays disabled"
+            )
+            return
+        try:
+            # Third Party
+            from lmcache.v1.distributed.api import ObjectKey
+            from lmcache.v1.rpc_utils import get_zmq_context
+
+            # Mirror the worker-specific store-key derivation exactly
+            # (see ipc_key_to_object_keys): the adapter's worker_id /
+            # world_size already carry the kv-rank semantics (MLA / DCP
+            # aware), so the oracle queries the same shard the decoder
+            # itself stores under.
+            kv_rank = ObjectKey.ComputeKVRank(
+                world_size=adapter.world_size,
+                global_rank=adapter.worker_id,
+                local_world_size=adapter.world_size,
+                local_rank=adapter.worker_id,
+            )
+            metadata = engine.metadata
+            shape = list(metadata.kv_shape)
+            token_dim = engine.fmt.token_dim() if engine.fmt else 2
+            shape[token_dim] = mp_chunk
+            oracle = L1QueryOracle(
+                server_url,
+                get_zmq_context(use_asyncio=False),
+                model_name=metadata.model_name,
+                kv_rank=kv_rank,
+                chunk_size=mp_chunk,
+                hash_algorithm=self._pd_l1_hash_algorithm,
+                kv_shape=torch.Size(shape),
+                kv_dtype=metadata.kv_dtype,
+            )
+            engine.attach_l1_oracle(oracle)
+        except Exception:
+            logger.exception(
+                "MP+PD: L1 oracle wiring failed; alloc dedup stays at "
+                "buffer level"
+            )
 
     def wait_for_save(self):
         self._pd_maybe_suppress_l1_stores()
@@ -284,9 +381,15 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             return
         for instr in getattr(metadata, "pd_load_instructions", None) or []:
             try:
-                failed = engine.execute_pd_load(instr, kvcaches)
+                failed, landed_end = engine.execute_pd_load(
+                    instr, kvcaches
+                )
                 if failed:
                     self._pd_failed_blocks.update(failed)
+                if landed_end > self._pd_loaded_pending.get(
+                    instr.request_id, 0
+                ):
+                    self._pd_loaded_pending[instr.request_id] = landed_end
                 self._pd_load_done.add(instr.request_id)
             except Exception:
                 logger.exception(
@@ -310,7 +413,35 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             done = self._pd_load_done
             self._pd_load_done = set()
             recving = set(recving or set()) | done
+        self._pd_drain_consumer_store_tracking(finished_req_ids)
         return sending, recving
+
+    def _pd_drain_consumer_store_tracking(
+        self, finished_req_ids: set[str]
+    ) -> None:
+        """Drop store-through completions the adapter can never report.
+
+        Upstream consumers pass an empty engine-finished set to the
+        worker adapter (``_can_store`` is producer-only), so completed
+        store ids would sit in ``finished_stores`` forever. Harmless
+        for upstream (consumers never store); with store-through the
+        decoder does store, so bound the tracking by the request
+        lifetime: once the engine reports the request finished, its
+        store id is dead weight (the id would never be returned
+        anyway). Producer behavior is untouched.
+        """
+        engine = self._pd_engine
+        adapter = getattr(self, "worker_adapter", None)
+        if (
+            not finished_req_ids
+            or engine is None
+            or engine.pd_role != "receiver"
+            or adapter is None
+        ):
+            return
+        for req_id in finished_req_ids:
+            adapter.finished_stores.discard(req_id)
+            adapter.previously_finished.discard(req_id)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         errors = super().get_block_ids_with_load_errors()
@@ -328,6 +459,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             metadata is None
             and not self._pd_received
             and not self._pd_arrived_pending
+            and not self._pd_loaded_pending
         ):
             return None
         base = metadata
@@ -341,8 +473,10 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         )
         out.pd_received = self._pd_received
         out.pd_arrived_keys = self._pd_arrived_pending
+        out.pd_loaded = self._pd_loaded_pending
         self._pd_received = {}
         self._pd_arrived_pending = []
+        self._pd_loaded_pending = {}
         return out
 
     def shutdown(self):
@@ -385,6 +519,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             load_instructions = self._pd_build_load_instructions()
             if load_instructions:
                 metadata.pd_load_instructions = load_instructions
+            self._pd_inject_store_through(metadata)
         return metadata
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -394,6 +529,15 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             return
         if meta.pd_arrived_keys:
             self._pd_arrived.update(meta.pd_arrived_keys)
+        for req_id, landed in (getattr(meta, "pd_loaded", None) or {}).items():
+            if landed > self._pd_landed.get(req_id, 0):
+                self._pd_landed[req_id] = landed
+                logger.debug(
+                    "MP+PD store-through: req %s landed prefix is now %d "
+                    "tokens",
+                    req_id,
+                    landed,
+                )
         if not meta.pd_received:
             return
         for req_id, pd_tokens in meta.pd_received.items():
@@ -453,6 +597,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         self._ledgers.pop(request.request_id, None)
         self._pd_specs.pop(request.request_id, None)
         self._pd_load_issued.discard(request.request_id)
+        self._pd_landed.pop(request.request_id, None)
         # Disagg proxy handshake: the proxy reads first_tok from the
         # prefill response's kv_transfer_params to build the decode
         # request (prefill generates the first token, decode continues
@@ -641,6 +786,104 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             else:
                 break
         return reached
+
+    def _pd_inject_store_through(self, metadata) -> None:
+        """Persist the PD-landed prefix into the decoder's L1 (Step 6).
+
+        Upstream never stores from the decoder: ``_can_store`` is
+        producer-only and ``GetStoreMetadata`` bounds the store range
+        by computed tokens, which excludes the PD-loaded prefix. So a
+        repeated prompt finds an empty decoder cache and forces a full
+        PD re-transfer.
+
+        The fix rides upstream's own store data path: for each request
+        whose worker-confirmed landed prefix (``pd_loaded`` -- the
+        leading run of D2D loads that succeeded) reaches past
+        ``num_stored_tokens``, emit one extra STORE-direction request
+        metadata block covering the missing full server chunks and
+        advance ``num_stored_tokens`` to keep upstream's "already
+        stored" invariant. The worker's ``wait_for_save`` executes it
+        like any store (paged-pool gather -> D2H -> the decoder's
+        server); the blocks still belong to the running request, so
+        the data cannot have been evicted underneath the store.
+
+        Emitted after ``super().build_connector_meta`` -- on v0.5.6 the
+        decoder generates no regular stores (``_can_store`` false), so
+        the pseudo store is the only one and no overlap exists.
+        """
+        if not self._pd_store_through or not self._pd_landed:
+            return
+        mp_chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
+        group_tokens_per_block = getattr(self, "_group_tokens_per_block", None)
+        if not mp_chunk or not group_tokens_per_block:
+            return
+        trackers = getattr(self, "request_trackers", None) or {}
+        for req_id in list(self._pd_landed):
+            tracker = trackers.get(req_id)
+            if tracker is None:
+                continue
+            landed = self._pd_landed[req_id]
+            # Only complete server chunks are storable (upstream
+            # invariant: num_stored_tokens stays a multiple of
+            # lmcache_tokens_per_chunk); the PD tail beyond the last
+            # full server chunk waits for the regular computed store
+            # or is not stored (documented: set the PD chunk size
+            # equal to the server chunk size for full coverage).
+            store_end = min(
+                landed // mp_chunk * mp_chunk,
+                len(tracker.all_token_ids),
+                tracker.num_prompt_tokens,
+            )
+            start = tracker.num_stored_tokens
+            num_chunks = (store_end - start) // mp_chunk
+            if num_chunks <= 0:
+                continue
+            end = start + num_chunks * mp_chunk
+            try:
+                block_ids = slice_block_ids_per_group(
+                    tracker.allocated_block_ids,
+                    group_tokens_per_block,
+                    start,
+                    end,
+                )
+            except ValueError:
+                logger.warning(
+                    "MP+PD store-through: req %s range [%d,%d) does not "
+                    "align to a KV group; skipping this step",
+                    req_id,
+                    start,
+                    end,
+                )
+                continue
+            store_meta = LMCacheMPRequestMetadata(
+                request_id=req_id,
+                direction="STORE",
+                op=LoadStoreOp(
+                    token_ids=tracker.get_token_ids(),
+                    block_ids=block_ids,
+                    start=start,
+                    end=end,
+                ),
+                cache_salt=tracker.cache_salt,
+                request_configs=tracker.request_configs,
+            )
+            if getattr(self, "lazy_offload", False):
+                self._lazy_offload_manager.add_store_candidate(store_meta)
+            else:
+                metadata.add_request_metadata(store_meta)
+            tracker.increase_num_stored_tokens(end - start)
+            logger.info(
+                "MP+PD store-through: storing req %s [%d,%d) from the "
+                "PD-landed prefix",
+                req_id,
+                start,
+                end,
+            )
+            # The num_stored_tokens advance makes re-emission idempotent.
+            # The landed marker itself stays: if upstream ever resets
+            # num_stored_tokens (failed-load bypass), the re-store would
+            # persist recomputed -- content-identical -- data, which is
+            # redundant but correct. request_finished drops the marker.
 
     def _pd_build_load_instructions(self) -> list:
         """Worker orders to land PD-arrived ranges into the paged pool.

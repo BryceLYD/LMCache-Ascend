@@ -63,6 +63,12 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         self.running = True
         self.tp_rank = metadata.worker_id
 
+        # Optional L1 residency oracle (receiver only). Injected by the
+        # MP+PD connector after assembly (see PDEngine.attach_l1_oracle);
+        # the alloc handlers consult it to dedup incoming chunks against
+        # the decoder's own LMCache server.
+        self.l1_oracle = None
+
         self.pd_config = PDConfig.from_cache_engine_config(
             config, metadata, self.tp_rank
         )

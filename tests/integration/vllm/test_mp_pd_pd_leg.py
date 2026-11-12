@@ -127,7 +127,13 @@ def _make_scheduler_connector(lookup_results=(0,)):
     connector._pd_load_issued = set()
     connector._pd_load_done = set()
     connector._pd_failed_blocks = set()
+    connector._pd_landed = {}
+    connector._pd_loaded_pending = {}
+    connector._pd_store_through = False
+    connector._pd_alloc_check_l1 = False
+    connector._pd_l1_hash_algorithm = "blake3"
     connector._pd_save_policy = "both"
+    connector._group_tokens_per_block = [16]
     connector.request_trackers = {}
     connector.scheduler_adapter = _FakeSchedulerAdapter(
         list(lookup_results)
@@ -667,7 +673,6 @@ def test_request_finished_returns_first_tok_for_disagg_prefill():
 
 
 def test_request_finished_skips_first_tok_without_disagg_spec():
-    stack = _import_stack()
     connector, _ = _make_scheduler_connector()
     connector._vllm_config.kv_transfer_config.kv_role = "kv_producer"
 
