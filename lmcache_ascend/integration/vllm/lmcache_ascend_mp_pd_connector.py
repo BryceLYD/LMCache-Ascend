@@ -811,16 +811,32 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         decoder generates no regular stores (``_can_store`` false), so
         the pseudo store is the only one and no overlap exists.
         """
-        if not self._pd_store_through or not self._pd_landed:
+        if not self._pd_store_through:
+            return
+        if not self._pd_landed:
+            logger.debug(
+                "MP+PD store-through: landed map empty this step"
+            )
             return
         mp_chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
         group_tokens_per_block = getattr(self, "_group_tokens_per_block", None)
         if not mp_chunk or not group_tokens_per_block:
+            logger.warning(
+                "MP+PD store-through: missing chunk geometry "
+                "(mp_chunk=%s group_tokens_per_block=%s); cannot inject",
+                mp_chunk,
+                group_tokens_per_block,
+            )
             return
         trackers = getattr(self, "request_trackers", None) or {}
         for req_id in list(self._pd_landed):
             tracker = trackers.get(req_id)
             if tracker is None:
+                logger.debug(
+                    "MP+PD store-through: req %s landed=%d but no tracker",
+                    req_id,
+                    self._pd_landed[req_id],
+                )
                 continue
             landed = self._pd_landed[req_id]
             # Only complete server chunks are storable (upstream
@@ -837,7 +853,15 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             start = tracker.num_stored_tokens
             num_chunks = (store_end - start) // mp_chunk
             if num_chunks <= 0:
-                continue
+                logger.debug(
+                    "MP+PD store-through: req %s landed=%d store_end=%d "
+                    "start=%d mp_chunk=%d -> no full chunk to store",
+                    req_id,
+                    landed,
+                    store_end,
+                    start,
+                    mp_chunk,
+                )
             end = start + num_chunks * mp_chunk
             try:
                 block_ids = slice_block_ids_per_group(
@@ -870,7 +894,9 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             if getattr(self, "lazy_offload", False):
                 self._lazy_offload_manager.add_store_candidate(store_meta)
             else:
-                metadata.add_request_metadata(store_meta)
+                # v0.5.6 metadata carries a plain ``requests`` list (no
+                # add_request_metadata helper): append directly.
+                metadata.requests.append(store_meta)
             tracker.increase_num_stored_tokens(end - start)
             logger.info(
                 "MP+PD store-through: storing req %s [%d,%d) from the "
