@@ -501,6 +501,19 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         spec = extract_pd_transfer_spec(request)
         if spec is not None:
             self._pd_specs[request.request_id] = spec
+            logger.info(
+                "MP+PD: delivery spec captured for req %s (proxy req %s, "
+                "%d prompt tokens)",
+                request.request_id,
+                spec.req_id,
+                spec.num_prompt_tokens,
+            )
+        elif request.request_id not in self._pd_specs:
+            logger.debug(
+                "MP+PD: req %s carries no disagg_spec (direct request or "
+                "proxy-free path); PD send inactive for it",
+                request.request_id,
+            )
 
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
@@ -651,6 +664,10 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         keys and the token database are built from).
         """
         if not self._pd_specs:
+            logger.debug(
+                "MP+PD send: no delivery specs captured this step "
+                "(requests carry no disagg_spec?)"
+            )
             return []
         trackers = getattr(self, "request_trackers", None) or {}
         chunk = self._pd_chunk_size or (
@@ -677,12 +694,25 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         for req_id, spec in list(self._pd_specs.items()):
             tracker = trackers.get(req_id)
             if tracker is None:
+                logger.debug(
+                    "MP+PD send: req %s has a spec but no tracker yet",
+                    req_id,
+                )
                 continue
             handled = min(
                 tracker.num_lmcache_hit_tokens + tracker.num_scheduled_tokens,
                 spec.num_prompt_tokens,
             )
             ship = self._pd_save_policy != "l1_only"
+            logger.debug(
+                "MP+PD send: req %s handled=%d sent_end=%d chunk=%d "
+                "ship=%s",
+                req_id,
+                handled,
+                spec.sent_end,
+                chunk,
+                ship,
+            )
             if handled <= spec.sent_end or not ship:
                 if (
                     handled >= spec.num_prompt_tokens
