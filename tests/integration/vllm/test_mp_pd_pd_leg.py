@@ -536,6 +536,28 @@ def test_merged_lookup_matches_arrived_without_spec():
     ]
 
 
+def test_merged_lookup_fails_closed_after_reset():
+    """A request reset by vLLM (invalid load blocks / preemption) after
+    its PD load was issued must NOT report another external hit: it
+    would park in WAITING_FOR_REMOTE_KVS with no second recving report
+    to release it (the load instruction is one-shot). Fail closed to
+    recompute, mirroring upstream's failed-async-load bypass."""
+    connector, _ = _make_scheduler_connector(lookup_results=(0,))
+    _enable_pd_merge(connector, {"key-0", "key-1", "key-2"})
+    request = _fake_request("reset", 700)
+    connector._pd_load_issued.add("reset")
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+
+    # First lookups (load not yet issued) keep the merged semantics.
+    fresh_connector, _ = _make_scheduler_connector(lookup_results=(0,))
+    _enable_pd_merge(fresh_connector, {"key-0", "key-1", "key-2"})
+    fresh_request = _fake_request("fresh", 700)
+    assert fresh_connector.get_num_new_matched_tokens(fresh_request, 0) == (
+        699,
+        True,
+    )
+
+
 def test_pd_build_load_instructions_once():
     connector, _ = _make_scheduler_connector(lookup_results=(4 * 256,))
     _enable_pd_merge(connector, {"key-4", "key-5"})

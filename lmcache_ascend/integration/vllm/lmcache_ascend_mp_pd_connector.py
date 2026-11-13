@@ -436,6 +436,13 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             done = self._pd_load_done
             self._pd_load_done = set()
             recving = set(recving or set()) | done
+        # The once-per-request recving guard lives on the WORKER (where
+        # the loads run), but request_finished only cleans the scheduler
+        # half -- a different process. Retire the guard with the engine's
+        # own finished set so a reused request id can report its first
+        # load again instead of hanging in WAITING_FOR_REMOTE_KVS.
+        if finished_req_ids:
+            self._pd_recv_reported -= set(finished_req_ids)
         self._pd_drain_consumer_store_tracking(finished_req_ids)
         return sending, recving
 
@@ -605,6 +612,26 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             # upstream semantics unchanged (None retried by vLLM).
             self._sync_ledger_from_tracker(request, num_computed_tokens)
             return result
+        if (
+            num_computed_tokens == 0
+            and request.request_id in self._pd_load_issued
+        ):
+            # vLLM reset this request (invalid load blocks / preemption)
+            # after its PD load was already issued and reported once.
+            # Reporting another external hit would park it back in
+            # WAITING_FOR_REMOTE_KVS, but no second finished_recving
+            # will ever arrive (the load instruction is one-shot and
+            # _pd_note_load_done reports once), deadlocking the request.
+            # Fail closed to a local recompute, mirroring upstream's
+            # failed-async-load bypass. First lookups never hit this:
+            # the load instruction is issued only after they return.
+            logger.info(
+                "MP+PD merged lookup: req %s was reset after its PD "
+                "load; failing closed to recompute",
+                request.request_id,
+            )
+            self._sync_ledger_from_tracker(request, num_computed_tokens)
+            return 0, False
         trackers = getattr(self, "request_trackers", None) or {}
         tracker = trackers.get(request.request_id)
         l1_tokens = tracker.num_lmcache_hit_tokens if tracker else 0

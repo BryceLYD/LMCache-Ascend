@@ -371,6 +371,31 @@ def test_pd_load_done_reported_once_per_request():
     assert connector._pd_load_done == {"r1"}
 
 
+def test_get_finished_retires_recv_reported_guard():
+    """The once-per-request guard lives on the worker, request_finished
+    only cleans the scheduler half (another process): get_finished must
+    retire the guard from the engine's finished set so a REUSED request
+    id can report its first load instead of hanging."""
+    stack = _import_stack()
+    connector = _make_connector(stack)
+    connector._pd_recv_reported = {"r1", "r2"}
+
+    # Standard
+    from unittest.mock import patch
+
+    # Third Party
+    from lmcache.integration.vllm.lmcache_mp_connector import (
+        LMCacheMPConnector,
+    )
+
+    with patch.object(
+        LMCacheMPConnector, "get_finished", return_value=(None, None)
+    ):
+        sending, recving = connector.get_finished({"r2"})
+    assert sending is None and recving is None
+    assert connector._pd_recv_reported == {"r1"}
+
+
 def test_request_finished_drops_landed_marker():
     stack = _import_stack()
     connector = _make_connector(stack)
