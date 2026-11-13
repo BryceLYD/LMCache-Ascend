@@ -51,6 +51,7 @@ import torch
 # First Party
 from lmcache_ascend.v1.npu_connector.npu_connectors import VLLMPagedMemNPUConnectorV2
 from lmcache_ascend.v1.storage_backend.pd.backend import AscendPDBackend
+from lmcache_ascend.v1.storage_backend.utils import release_memory_objects
 
 if TYPE_CHECKING:
     # Third Party
@@ -661,7 +662,19 @@ class PDEngine:
                 len(objs),
                 result,
             )
-        self.backend.batched_submit_put_task(keys, objs, transfer_spec=instr)
+        # The upstream batched_submit_put_task contract has the CALLER
+        # release the allocation reference when the call returns (the
+        # storage_manager does it on the in-process path). PDEngine
+        # bypasses the storage manager, so it must act as that caller:
+        # the push sub-method's own up/down pair is net zero, and this
+        # final release retires the allocate() reference on every path
+        # (sent, already-sent, alloc-failed, backoff-skip, exception).
+        try:
+            self.backend.batched_submit_put_task(
+                keys, objs, transfer_spec=instr
+            )
+        finally:
+            release_memory_objects(objs)
 
     def send_proxy_notification(self, req_id: str) -> None:
         """Open the disagg proxy gate for a request.
