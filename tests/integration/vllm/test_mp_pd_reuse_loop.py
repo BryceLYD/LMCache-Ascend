@@ -435,8 +435,8 @@ def _sender(stack):
 
 def _mem_obj():
     # Third Party
-    import torch
     from lmcache.v1.memory_management import MemoryFormat
+    import torch
 
     # KV_2LTD: token dim at index 2 (see the _alloc_msg note).
     return SimpleNamespace(
