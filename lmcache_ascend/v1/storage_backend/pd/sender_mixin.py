@@ -515,6 +515,27 @@ class AscendPDSenderMixin:
                 "All memory objects already sent to remote peer. Skipping transfer."
             )
 
+        # One-line transfer summary: what the decoder asked for vs what
+        # actually went over the wire after buffer/L1 dedup.
+        chunk_tokens = (
+            memory_objs[0].meta.shape[
+                memory_objs[0].meta.fmt.token_dim()
+            ]
+            if memory_objs
+            else 0
+        )
+        logger.info(
+            "PD XFER req=%s rank=%d total_chunks=%d sent_chunks=%d "
+            "skipped_chunks=%d approx_tokens=%d -> %s",
+            transfer_spec.req_id,
+            self.tp_rank,
+            len(memory_objs),
+            len(mem_objs_to_send),
+            len(memory_objs) - len(mem_objs_to_send),
+            len(mem_objs_to_send) * chunk_tokens,
+            receiver_id,
+        )
+
         if transfer_spec.is_last_prefill:
             self.send_proxy_notification(transfer_spec.req_id)
 

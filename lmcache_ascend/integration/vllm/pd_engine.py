@@ -675,6 +675,14 @@ class PDEngine:
             )
         finally:
             release_memory_objects(objs)
+        logger.info(
+            "PD SEND req=%s range=[%d,%d) chunks=%d tokens=%d",
+            instr.req_id,
+            instr.start,
+            instr.end,
+            len(objs),
+            instr.end - instr.start,
+        )
 
     def send_proxy_notification(self, req_id: str) -> None:
         """Open the disagg proxy gate for a request.
@@ -817,6 +825,16 @@ class PDEngine:
                 pass
             for obj in objs:
                 obj.ref_count_down()
+        logger.info(
+            "PD LOAD req=%s landed=[%d,%d) landed_tokens=%d "
+            "chunks_loaded=%d chunks_failed=%d",
+            instr.request_id,
+            instr.start,
+            landed_end,
+            landed_end - instr.start,
+            len(objs),
+            len(failed_blocks) > 0 and 1 or 0,
+        )
         return sorted(failed_blocks), landed_end
 
     def attach_l1_oracle(self, oracle: Optional["L1QueryOracle"]) -> None:
