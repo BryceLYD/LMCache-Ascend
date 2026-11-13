@@ -103,6 +103,7 @@ def _make_connector(stack, store_through=True):
     connector._pd_chunk_size = 256
     connector._pd_load_issued = set()
     connector._pd_load_done = set()
+    connector._pd_recv_reported = set()
     connector._pd_failed_blocks = set()
     connector._pd_landed = {}
     connector._pd_loaded_pending = {}
@@ -346,6 +347,30 @@ def test_update_connector_output_records_pd_loaded_monotonically():
     assert connector._pd_landed == {"r1": 512}
 
 
+def test_pd_load_done_reported_once_per_request():
+    """vLLM's finished_recving contract requires the request to be in
+    WAITING_FOR_REMOTE_KVS (or finished); only the FIRST PD load of a
+    request completes while WAITING. Follow-up incremental loads land
+    while the request is RUNNING and must not re-enter the recving
+    stream (the incremental E2E crash: assert RequestStatus.is_finished
+    in vllm's _update_from_kv_xfer_finished)."""
+    stack = _import_stack()
+    connector = _make_connector(stack)
+    connector._pd_note_load_done("r1")
+    assert connector._pd_load_done == {"r1"}
+    # Second load of the same request: accounting only, no re-report.
+    connector._pd_note_load_done("r1")
+    assert connector._pd_load_done == {"r1"}
+    # A different request still reports its first load.
+    connector._pd_note_load_done("r2")
+    assert connector._pd_load_done == {"r1", "r2"}
+    # request_finished resets the guard for a future same-id request.
+    connector._pd_recv_reported.discard("r1")
+    connector._pd_load_done.clear()
+    connector._pd_note_load_done("r1")
+    assert connector._pd_load_done == {"r1"}
+
+
 def test_request_finished_drops_landed_marker():
     stack = _import_stack()
     connector = _make_connector(stack)
@@ -410,13 +435,14 @@ def _sender(stack):
 
 def _mem_obj():
     # Third Party
-    from lmcache.v1.memory_management import MemoryFormat
     import torch
+    from lmcache.v1.memory_management import MemoryFormat
 
+    # KV_2LTD: token dim at index 2 (see the _alloc_msg note).
     return SimpleNamespace(
         meta=SimpleNamespace(
             fmt=MemoryFormat.KV_2LTD,
-            shape=torch.Size([2, 256, 8, 128]),
+            shape=torch.Size([2, 8, 256, 128]),
             dtype=torch.bfloat16,
         )
     )

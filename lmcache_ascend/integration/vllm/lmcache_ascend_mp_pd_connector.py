@@ -162,6 +162,9 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         self._pd_landed: dict[str, int] = {}
         # Step 5: worker-side PD load completion / failure state.
         self._pd_load_done: set[str] = set()
+        # Requests whose PD load completion was already reported to vLLM
+        # through finished_recving (see _pd_note_load_done).
+        self._pd_recv_reported: set[str] = set()
         self._pd_failed_blocks: set[int] = set()
         # Step 6: worker-side landed reports awaiting the next
         # build_connector_worker_meta call.
@@ -390,7 +393,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     instr.request_id, 0
                 ):
                     self._pd_loaded_pending[instr.request_id] = landed_end
-                self._pd_load_done.add(instr.request_id)
+                self._pd_note_load_done(instr.request_id)
             except Exception:
                 logger.exception(
                     "PD load failed for req %s [%d,%d); marking its "
@@ -399,11 +402,31 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     instr.start,
                     instr.end,
                 )
-                self._pd_load_done.add(instr.request_id)
+                self._pd_note_load_done(instr.request_id)
                 for pos in range(instr.start, instr.end):
                     idx = pos // instr.block_size
                     if 0 <= idx < len(instr.block_ids):
                         self._pd_failed_blocks.add(instr.block_ids[idx])
+
+    def _pd_note_load_done(self, request_id: str) -> None:
+        """Report a PD load completion to vLLM at most once per request.
+
+        vLLM's ``_update_from_kv_xfer_finished`` requires a
+        ``finished_recving`` request to be either still in
+        WAITING_FOR_REMOTE_KVS (the signal releases it for scheduling)
+        or already finished (the signal frees blocks). The FIRST PD load
+        of a request completes while it is WAITING, so reporting it
+        releases the request correctly. Follow-up loads of the same
+        request (incremental chunks arriving after the request was
+        released) land while it is RUNNING, and reporting those crashes
+        the scheduler with an assertion. The store-through accounting
+        for follow-up loads flows through ``pd_loaded`` instead, so
+        nothing is lost by suppressing the repeat reports.
+        """
+        if request_id in self._pd_recv_reported:
+            return
+        self._pd_recv_reported.add(request_id)
+        self._pd_load_done.add(request_id)
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -610,6 +633,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         self._ledgers.pop(request.request_id, None)
         self._pd_specs.pop(request.request_id, None)
         self._pd_load_issued.discard(request.request_id)
+        self._pd_recv_reported.discard(request.request_id)
         self._pd_landed.pop(request.request_id, None)
         # Disagg proxy handshake: the proxy reads first_tok from the
         # prefill response's kv_transfer_params to build the decode
@@ -883,6 +907,10 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             start = tracker.num_stored_tokens
             num_chunks = (store_end - start) // mp_chunk
             if num_chunks <= 0:
+                # Guard, not just tracing: a later-resolved L1 lookup can
+                # push num_stored_tokens past this landed floor, making
+                # num_chunks negative -- falling through would emit a
+                # reversed op and push the watermark backwards.
                 logger.debug(
                     "MP+PD store-through: req %s landed=%d store_end=%d "
                     "start=%d mp_chunk=%d -> no full chunk to store",
@@ -892,6 +920,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     start,
                     mp_chunk,
                 )
+                continue
             end = start + num_chunks * mp_chunk
             try:
                 block_ids = slice_block_ids_per_group(
@@ -924,8 +953,9 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             if getattr(self, "lazy_offload", False):
                 self._lazy_offload_manager.add_store_candidate(store_meta)
             else:
-                # v0.5.6 metadata carries a plain ``requests`` list (no
-                # add_request_metadata helper): append directly.
+                # Append directly: v0.5.6's add_request_metadata is just
+                # requests.append, and older metadata containers carry
+                # the plain list without the helper.
                 metadata.requests.append(store_meta)
             tracker.increase_num_stored_tokens(end - start)
             logger.info(

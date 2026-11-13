@@ -126,6 +126,7 @@ def _make_scheduler_connector(lookup_results=(0,)):
     connector._pd_chunk_size = 256
     connector._pd_load_issued = set()
     connector._pd_load_done = set()
+    connector._pd_recv_reported = set()
     connector._pd_failed_blocks = set()
     connector._pd_landed = {}
     connector._pd_loaded_pending = {}
