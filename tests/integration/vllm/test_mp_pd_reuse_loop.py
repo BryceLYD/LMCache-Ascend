@@ -404,9 +404,7 @@ def test_get_finished_retires_recv_reported_guard():
     from unittest.mock import patch
 
     # Third Party
-    from lmcache.integration.vllm.lmcache_mp_connector import (
-        LMCacheMPConnector,
-    )
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
 
     with patch.object(
         LMCacheMPConnector, "get_finished", return_value=(None, None)
