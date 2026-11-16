@@ -46,6 +46,7 @@ Step status:
 
 # Standard
 from typing import TYPE_CHECKING, Any, Optional
+import time
 
 # Third Party
 from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
@@ -70,7 +71,6 @@ from lmcache_ascend.integration.vllm.pd_engine import (
     PDSendInstruction,
     PDTransferSpec,
     build_pd_chunk_db,
-    extract_pd_transfer_spec,
 )
 from lmcache_ascend.v1.mp_pd import RequestLedger
 import lmcache_ascend  # noqa: F401
@@ -147,6 +147,31 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         # behavior when off or when their plumbing errors.
         self._pd_store_through = bool(extra.get("pd_store_through", True))
         self._pd_alloc_check_l1 = bool(extra.get("pd_alloc_check_l1", True))
+        # Router-orchestrated PD (1P1D static): the producer's delivery
+        # peer comes from config, never from per-request params.
+        self._pd_kv_role = (
+            kv_transfer_config.kv_role if kv_transfer_config else None
+        )
+        self._pd_peer_host: Optional[str] = extra.get("pd_peer_host")
+        self._pd_peer_init_port: Optional[list] = extra.get(
+            "pd_peer_init_port"
+        )
+        self._pd_peer_alloc_port: Optional[list] = extra.get(
+            "pd_peer_alloc_port"
+        )
+        # D-side bounded wait for an in-flight/partial PD arrival
+        # before failing closed to recompute (seconds).
+        self._pd_pending_timeout = float(
+            extra.get("pd_pending_timeout", 3.0)
+        )
+        # Mirrors the engine's chunk-tail policy: when the producer
+        # never ships the trailing partial chunk, the decoder's
+        # expected arrival end floors to the chunk grid.
+        self._pd_save_unfull_chunk = bool(
+            extra.get("save_unfull_chunk", True)
+        )
+        # First-lookup timestamp per request with a partial PD arrival.
+        self._pd_pending_since: dict[str, float] = {}
         # Must match the server fleet's hashing (the same key the MP
         # adapters resolve; default "blake3" on both sides).
         self._pd_l1_hash_algorithm = str(
@@ -180,6 +205,19 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 self._pd_key_db, self._pd_chunk_size = build_pd_chunk_db(
                     vllm_config, extra
                 )
+                if (
+                    self._pd_kv_role == "kv_producer"
+                    and not self._pd_peer_configured()
+                ):
+                    raise ValueError(
+                        "PD leg is configured on a kv_producer but the "
+                        "delivery peer is not: set pd_peer_host, "
+                        "pd_peer_init_port, and pd_peer_alloc_port (the "
+                        "decode node's init/alloc port lists) in "
+                        "kv_connector_extra_config. Under the "
+                        "router-orchestrated flow these are the only "
+                        "source of the transfer destination."
+                    )
                 mp_chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
                 if (
                     self._pd_chunk_size <= 0
@@ -282,31 +320,16 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
     def _pd_execute_send_instructions(self, metadata) -> None:
         for instr in getattr(metadata, "pd_send_instructions", None) or []:
             try:
-                if getattr(instr, "notify_only", False):
-                    self._pd_engine.send_proxy_notification(instr.req_id)
-                    continue
                 self._pd_engine.execute_send(instr, self._pd_kv_caches)
             except Exception:
                 logger.exception(
-                    "PD send failed for req %s [%d,%d); the receiver will "
-                    "recompute the missing range.",
+                    "PD send failed for req %s [%d,%d); the receiver "
+                    "will recompute the missing range after its "
+                    "pending wait expires.",
                     instr.req_id,
                     instr.start,
                     instr.end,
                 )
-                if instr.is_last_prefill:
-                    # The proxy gates the decode request on this
-                    # notification; without it the client would hang even
-                    # though the receiver would have recomputed the
-                    # missing range. Open the gate no matter what.
-                    try:
-                        self._pd_engine.send_proxy_notification(instr.req_id)
-                    except Exception:
-                        logger.exception(
-                            "Proxy notification for req %s failed; the "
-                            "disagg proxy will keep waiting.",
-                            instr.req_id,
-                        )
 
     def _pd_maybe_suppress_l1_stores(self) -> None:
         """pd_only policy: skip the L1 store for PD-routed requests.
@@ -558,22 +581,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         super().update_state_after_alloc(
             request, blocks, num_external_tokens
         )
-        spec = extract_pd_transfer_spec(request)
-        if spec is not None:
-            self._pd_specs[request.request_id] = spec
-            logger.info(
-                "MP+PD: delivery spec captured for req %s (proxy req %s, "
-                "%d prompt tokens)",
-                request.request_id,
-                spec.req_id,
-                spec.num_prompt_tokens,
-            )
-        elif request.request_id not in self._pd_specs:
-            logger.debug(
-                "MP+PD: req %s carries no disagg_spec (direct request or "
-                "proxy-free path); PD send inactive for it",
-                request.request_id,
-            )
+        self._pd_maybe_capture_spec(request)
 
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
@@ -630,10 +638,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         num_computed_tokens: int,
     ) -> tuple[Optional[int], bool]:
         # The 发货单 may first appear here, before any allocation.
-        if request.request_id not in self._pd_specs:
-            spec = extract_pd_transfer_spec(request)
-            if spec is not None:
-                self._pd_specs[request.request_id] = spec
+        self._pd_maybe_capture_spec(request)
         result = super().get_num_new_matched_tokens(
             request, num_computed_tokens
         )
@@ -666,6 +671,16 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         tracker = trackers.get(request.request_id)
         l1_tokens = tracker.num_lmcache_hit_tokens if tracker else 0
         pd_tokens = self._pd_union_prefix(request, l1_tokens)
+        if self._pd_maybe_wait_for_arrival(
+            request, l1_tokens, pd_tokens
+        ):
+            # A PD transfer for this content demonstrably started but
+            # the union walk stopped short: hold the request (vLLM
+            # re-queries next scheduler step) until the rest lands or
+            # the bounded wait expires (then the normal recompute path
+            # below takes over).
+            self._sync_ledger_from_tracker(request, num_computed_tokens)
+            return None, False
         ledger = self._ledger_for(request.request_id)
         ledger.update_coverage(num_computed_tokens, l1_tokens, pd_tokens)
         external = ledger.external_tokens
@@ -685,40 +700,113 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        spec = self._pd_specs.get(request.request_id)
         result = super().request_finished(request, block_ids)
         self._ledgers.pop(request.request_id, None)
         self._pd_specs.pop(request.request_id, None)
         self._pd_load_issued.discard(request.request_id)
         self._pd_recv_reported.discard(request.request_id)
         self._pd_landed.pop(request.request_id, None)
-        # Disagg proxy handshake: the proxy reads first_tok from the
-        # prefill response's kv_transfer_params to build the decode
-        # request (prefill generates the first token, decode continues
-        # from the second). vLLM natively echoes the connector's
-        # request_finished params into the response, but the MP
-        # connector super-chain never produces first_tok — fill it here
-        # for disagg-routed prefill requests.
-        kv_role = getattr(
-            getattr(self._vllm_config, "kv_transfer_config", None),
-            "kv_role",
-            None,
-        )
-        if (
-            spec is not None
-            and kv_role == "kv_producer"
-            and isinstance(result, tuple)
-        ):
-            output_ids = getattr(request, "output_token_ids", None) or []
-            if output_ids:
-                params = dict(result[1] or {})
-                params.setdefault("first_tok", output_ids[0])
-                result = (result[0], params)
+        self._pd_pending_since.pop(request.request_id, None)
         return result
 
     # ==============================
     # Helpers
     # ==============================
+
+    def _pd_peer_configured(self) -> bool:
+        return bool(
+            self._pd_peer_host
+            and self._pd_peer_init_port
+            and self._pd_peer_alloc_port
+        )
+
+    def _pd_maybe_capture_spec(self, request: "Request") -> None:
+        """Self-build the 发货单 for a producer request (router mode).
+
+        The router's generic PD gate forwards the prefill leg with the
+        full prompt; every producer request is therefore a PD request
+        whose transfer destination is the statically configured peer
+        (1P1D). Idempotent; no-op when PD is not configured.
+        """
+        if (
+            self._pd_kv_role != "kv_producer"
+            or self._pd_key_db is None
+            or not self._pd_peer_configured()
+            or request.request_id in self._pd_specs
+        ):
+            return
+        self._pd_specs[request.request_id] = PDTransferSpec(
+            req_id=request.request_id,
+            receiver_host=self._pd_peer_host,
+            receiver_init_port=self._pd_peer_init_port,
+            receiver_alloc_port=self._pd_peer_alloc_port,
+            num_prompt_tokens=request.num_prompt_tokens,
+        )
+        logger.info(
+            "MP+PD: delivery spec self-built for req %s -> %s "
+            "(init %s, %d prompt tokens)",
+            request.request_id,
+            self._pd_peer_host,
+            self._pd_peer_init_port,
+            request.num_prompt_tokens,
+        )
+
+    def _pd_maybe_wait_for_arrival(
+        self, request: "Request", l1_tokens: int, pd_tokens: int
+    ) -> bool:
+        """Bounded decoder-side wait for an incomplete PD arrival.
+
+        Under the router's generic PD gate the decode request only
+        starts after the prefill response completes, which is already
+        after the last synchronous D2D write — so a complete arrival
+        is the normal first-lookup state. A PARTIAL arrival (some
+        chunks of this content landed, the union walk stops early)
+        means the rest is either still settling (worker-report
+        latency, slow transport) or lost (alloc failure, dead
+        producer): hold the request for at most ``pd_pending_timeout``
+        seconds, then fail closed to recompute.
+
+        Requests with no PD arrival beyond L1 (direct requests, or a
+        transfer that never started) never wait — the missing range
+        recomputes immediately.
+        """
+        if self._pd_kv_role != "kv_consumer":
+            return False
+        if pd_tokens <= l1_tokens:
+            self._pd_pending_since.pop(request.request_id, None)
+            return False
+        prompt = request.num_prompt_tokens
+        expected = prompt if self._pd_save_unfull_chunk else (
+            prompt // self._pd_chunk_size * self._pd_chunk_size
+        )
+        if pd_tokens >= expected:
+            self._pd_pending_since.pop(request.request_id, None)
+            return False
+        now = time.monotonic()
+        since = self._pd_pending_since.setdefault(
+            request.request_id, now
+        )
+        waited = now - since
+        if waited < self._pd_pending_timeout:
+            logger.info(
+                "MP+PD: req %s PD arrival partial (%d/%d tokens, "
+                "L1=%d); waiting for the rest (%.1fs left)",
+                request.request_id,
+                pd_tokens,
+                expected,
+                l1_tokens,
+                self._pd_pending_timeout - waited,
+            )
+            return True
+        logger.warning(
+            "MP+PD: req %s PD arrival still partial (%d/%d tokens) "
+            "after %.1fs; failing closed to recompute",
+            request.request_id,
+            pd_tokens,
+            expected,
+            self._pd_pending_timeout,
+        )
+        return False
 
     def _ledger_for(self, request_id: str) -> RequestLedger:
         ledger = self._ledgers.get(request_id)
@@ -735,10 +823,9 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         shipped): without the L1 part, a producer-side cache hit would
         leave the decoder with a hole it can only fill by recomputing.
 
-        ``l1_only`` ships nothing through PD, but the proxy gate must
-        still open once the prefill phase is over (the decoder
-        recomputes everything), so notify-only instructions are emitted
-        for it too. The same gate guarantee applies whenever the
+        ``l1_only`` ships nothing through PD (the decoder recomputes
+        everything); the router gates the decode request on the
+        prefill response itself, so no notification is needed when the
         prefill phase ends with nothing left to ship.
 
         Ranges are aligned to the PD chunk size (the unit the chunk
@@ -746,8 +833,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         """
         if not self._pd_specs:
             logger.debug(
-                "MP+PD send: no delivery specs captured this step "
-                "(requests carry no disagg_spec?)"
+                "MP+PD send: no delivery specs captured this step"
             )
             return []
         trackers = getattr(self, "request_trackers", None) or {}
@@ -755,21 +841,6 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             self.scheduler_adapter.lmcache_tokens_per_chunk
         )
         block_size = self._vllm_config.cache_config.block_size
-
-        def _notify_only(spec, tracker, block_size):
-            return PDSendInstruction(
-                req_id=spec.req_id,
-                receiver_host=spec.receiver_host,
-                receiver_init_port=spec.receiver_init_port,
-                receiver_alloc_port=spec.receiver_alloc_port,
-                token_ids=tracker.get_token_ids(),
-                block_ids=[],
-                block_size=block_size,
-                start=spec.sent_end,
-                end=spec.sent_end,
-                is_last_prefill=True,
-                notify_only=True,
-            )
 
         instructions: list = []
         for req_id, spec in list(self._pd_specs.items()):
@@ -795,14 +866,6 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 ship,
             )
             if handled <= spec.sent_end or not ship:
-                if (
-                    handled >= spec.num_prompt_tokens
-                    and not spec.last_notified
-                ):
-                    instructions.append(
-                        _notify_only(spec, tracker, block_size)
-                    )
-                    spec.last_notified = True
                 continue
             if handled < spec.num_prompt_tokens:
                 end = handled // chunk * chunk
@@ -818,25 +881,9 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     req_id,
                     len(tracker.allocated_block_ids),
                 )
-                if (
-                    handled >= spec.num_prompt_tokens
-                    and not spec.last_notified
-                ):
-                    instructions.append(
-                        _notify_only(spec, tracker, block_size)
-                    )
-                    spec.last_notified = True
                 continue
             end = min(end, len(block_ids) * block_size)
             if end <= spec.sent_end:
-                if (
-                    handled >= spec.num_prompt_tokens
-                    and not spec.last_notified
-                ):
-                    instructions.append(
-                        _notify_only(spec, tracker, block_size)
-                    )
-                    spec.last_notified = True
                 continue
             is_last = end >= spec.num_prompt_tokens
             instructions.append(
@@ -854,8 +901,6 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 )
             )
             spec.sent_end = end
-            if is_last:
-                spec.last_notified = True
         return instructions
 
     @staticmethod
@@ -875,10 +920,10 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         ``pd_tokens`` is then this union end, which makes the PD_IN
         segment exactly the arrived range beyond L1.
 
-        Spec-free by design: the disagg proxy strips
-        ``kv_transfer_params`` from the decode request, so arrivals are
-        matched by content — the chunk keys derived from this request's
-        own tokens are exactly the keys the producer transferred.
+        Spec-free by design: arrivals are matched by content — the
+        chunk keys derived from this request's own tokens are exactly
+        the keys the producer transferred, so the decode leg works
+        identically behind any router or proxy.
         """
         if self._pd_key_db is None:
             return 0
@@ -1036,9 +1081,9 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         went missing by load time surfaces as a load error and vLLM
         recomputes it, so no retry is issued here.
 
-        Spec-free by design (see ``_pd_union_prefix``): the decode
-        request never carries ``disagg_spec`` — ledgers with a PD_IN
-        segment are the driver.
+        Spec-free by design (see ``_pd_union_prefix``): arrivals are
+        content-addressed, so ledgers with a PD_IN segment are the only
+        driver — no per-request transfer params exist.
         """
         if self._pd_key_db is None:
             return []

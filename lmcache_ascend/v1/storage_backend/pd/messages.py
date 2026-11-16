@@ -10,11 +10,7 @@ and receiver (decoder) over ZMQ side-channels, as well as the
 from typing import Union
 
 # Third Party
-from lmcache.v1.storage_backend.pd_backend import (
-    AllocRequest,
-    AllocResponse,
-    ProxyNotif,
-)
+from lmcache.v1.storage_backend.pd_backend import AllocRequest, AllocResponse
 import msgspec
 
 
@@ -107,7 +103,6 @@ AscendPDMsg = Union[
     AllocRequest,
     AscendAllocRequest,
     AscendAllocResponse,
-    ProxyNotif,
     PullReadyNotif,
     PullReadyDoneAck,
     PullDoneSignal,

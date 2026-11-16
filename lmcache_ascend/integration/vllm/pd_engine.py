@@ -11,8 +11,9 @@ directly here and driven from the connector hooks:
 * P (``kv_producer``) side: ``wait_for_save`` copies the chunk-aligned
   token range computed this step out of vLLM's paged pool into sender
   MemObjs and submits them via ``batched_submit_put_task`` (push mode:
-  remote allocation -> hccl/hixl batched_write -> proxy notification on
-  the last chunk).
+  remote allocation -> hccl/hixl batched_write; no proxy notification
+  — an external router gates the decode request on the prefill
+  response itself).
 * D (``kv_consumer``) side: the receiver mixin accepts incoming writes
   into its NPU buffer autonomously (its alloc handler and channel
   threads); the connector walks the chunk keys to observe how much of a
@@ -20,9 +21,9 @@ directly here and driven from the connector hooks:
   (worker -> scheduler metadata), where it lands in the ledger's
   ``pd_tokens`` — the observation feed for the Step-5 merge.
 
-The delivery plan (发货单: receiver host/ports, req id) rides on
-``request.kv_transfer_params["disagg_spec"]``, attached by the disagg
-router, mirroring the in-process line.
+The delivery plan (发货单: receiver host/ports, req id) is self-built
+on the producer from the static ``pd_peer_*`` config (1P1D static
+topology); no per-request transfer params are required.
 
 All PD configuration comes from ``kv_connector_extra_config`` using the
 same key names as the in-process YAML (``pd_buffer_size``,
@@ -69,9 +70,11 @@ _pd_logger = _lmcache_init_logger(__name__)
 class PDTransferSpec:
     """Scheduler-side 发货单 bookkeeping for one request.
 
-    Extracted from ``request.kv_transfer_params["disagg_spec"]`` when
-    blocks are allocated. ``sent_end`` tracks how much of the prompt has
-    been handed to the worker for PD delivery.
+    Self-built on the producer from the static peer config
+    (``pd_peer_host`` / ``pd_peer_init_port`` / ``pd_peer_alloc_port``)
+    -- the router-orchestrated flow carries no per-request transfer
+    params. ``sent_end`` tracks how much of the prompt has been handed
+    to the worker for PD delivery.
     """
 
     req_id: str
@@ -80,7 +83,6 @@ class PDTransferSpec:
     receiver_alloc_port: list
     num_prompt_tokens: int
     sent_end: int = 0
-    last_notified: bool = False
 
 
 @dataclass
@@ -102,12 +104,6 @@ class PDSendInstruction:
     start: int
     end: int
     is_last_prefill: bool = False
-
-    # Gate-key-only order: the prefill phase is over but no chunk is
-    # being shipped (e.g. the producer L1-hit the whole prompt); the
-    # worker only sends the proxy notification so the decode side is
-    # never left waiting on a transfer that will not happen.
-    notify_only: bool = False
 
 
 @dataclass
@@ -212,32 +208,6 @@ def build_pd_chunk_db(vllm_config: "VllmConfig", extra: dict) -> tuple:
         use_mla=use_mla,
     )
     return ChunkedTokenDatabase(db_config, db_metadata), chunk_size
-
-
-def extract_pd_transfer_spec(
-    request: "Request",
-) -> Optional[PDTransferSpec]:
-    """Pull the 发货单 out of a request's kv_transfer_params."""
-    params = getattr(request, "kv_transfer_params", None)
-    if not params or "disagg_spec" not in params:
-        return None
-    disagg = params["disagg_spec"]
-    try:
-        return PDTransferSpec(
-            req_id=disagg["req_id"],
-            receiver_host=disagg["receiver_host"],
-            receiver_init_port=disagg["receiver_init_port"],
-            receiver_alloc_port=disagg["receiver_alloc_port"],
-            num_prompt_tokens=request.num_prompt_tokens,
-        )
-    except (KeyError, TypeError, AttributeError) as e:
-        logger.warning(
-            "Malformed disagg_spec on request %s; PD leg disabled for it "
-            "(%r)",
-            getattr(request, "request_id", "?"),
-            e,
-        )
-        return None
 
 
 class L1QueryOracle:
@@ -487,11 +457,14 @@ class PDEngine:
             pd_peer_init_port=extra.get("pd_peer_init_port"),
             pd_peer_alloc_port=extra.get("pd_peer_alloc_port"),
             pd_peer_query_port=extra.get("pd_peer_query_port"),
-            pd_proxy_host=extra.get("pd_proxy_host"),
-            pd_proxy_port=extra.get("pd_proxy_port"),
-            pd_skip_proxy_notification=bool(
-                extra.get("pd_skip_proxy_notification", False)
-            ),
+            # Inert None values only: upstream v0.5.6's
+            # PDConfig.from_cache_engine_config reads these attributes
+            # unconditionally. The skip flag below keeps the base
+            # class from connecting any proxy (router-orchestrated
+            # deployment; no disagg proxy exists).
+            pd_proxy_host=None,
+            pd_proxy_port=None,
+            pd_skip_proxy_notification=True,
             pd_use_cpu_offload=bool(extra.get("pd_use_cpu_offload", False)),
             pd_pull_mode=bool(extra.get("pd_pull_mode", False)),
             pd_delay_pull=bool(extra.get("pd_delay_pull", False)),
@@ -633,7 +606,6 @@ class PDEngine:
             keys = keys[: len(objs)]
             starts = starts[: len(objs)]
             ends = ends[: len(objs)]
-            instr.is_last_prefill = False
 
         slots = []
         block_ids = instr.block_ids
@@ -683,22 +655,6 @@ class PDEngine:
             len(objs),
             instr.end - instr.start,
         )
-
-    def send_proxy_notification(self, req_id: str) -> None:
-        """Open the disagg proxy gate for a request.
-
-        The proxy blocks the decode request until this notification
-        arrives; it must be sent whenever the prefill phase is over,
-        regardless of whether any chunk was shipped or whether the
-        shipment failed — the decoder recomputes whatever did not
-        arrive, but it can only start once the gate opens.
-        """
-        if self.backend is None:
-            logger.error(
-                "PD engine not assembled; cannot notify proxy for %s", req_id
-            )
-            return
-        self.backend.send_proxy_notification(req_id)
 
     # ------------------------------------------------------------------
     # Receiver (D side)

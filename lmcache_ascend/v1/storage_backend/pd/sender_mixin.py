@@ -16,7 +16,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import TORCH_DTYPE_TO_STR_DTYPE, CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.rpc_utils import get_zmq_socket
-from lmcache.v1.storage_backend.pd_backend import AllocRequest, ProxyNotif
+from lmcache.v1.storage_backend.pd_backend import AllocRequest
 import msgspec
 import zmq
 
@@ -402,8 +402,6 @@ class AscendPDSenderMixin:
                 # would double-decrement the ref count, causing a
                 # premature free and PagedTensorMemoryAllocator
                 # double-free corruption.
-                if transfer_spec.is_last_prefill:
-                    self.send_proxy_notification(transfer_spec.req_id)
                 return
 
         if self.pull_mode:
@@ -411,22 +409,73 @@ class AscendPDSenderMixin:
         else:
             self._batched_submit_put_task_push(keys, memory_objs, transfer_spec)
 
-    def send_proxy_notification(self, req_id: str) -> None:
-        """Send the last-prefill notification to the disagg proxy.
+    def _ensure_peer_connection(
+        self,
+        receiver_id: str,
+        receiver_host: str,
+        receiver_init_port: int,
+        receiver_alloc_port: int,
+    ) -> None:
+        """Extend the base connection setup with REQ-socket timeouts.
 
-        This opens the gate the proxy waits on before forwarding the
-        decode request; it must fire whenever prefill is over, whether
-        chunks were shipped, skipped (producer L1 hit), or failed.
+        The alloc REQ socket otherwise blocks forever on a dead peer,
+        wedging the engine's save path. With the timeout a dead peer
+        surfaces as an alloc failure instead (release + peer backoff).
         """
-        if self.proxy_side_channel is None:
-            logger.warning(
-                "No proxy side channel configured; skipping notification "
-                "for req %s",
-                req_id,
+        super()._ensure_peer_connection(
+            receiver_id=receiver_id,
+            receiver_host=receiver_host,
+            receiver_init_port=receiver_init_port,
+            receiver_alloc_port=receiver_alloc_port,
+        )
+        sock = self.mem_alloc_sockets.get(receiver_id)
+        if sock is not None:
+            timeout_ms = int(
+                getattr(self._config, "pd_alloc_rpc_timeout_ms", 10000)
             )
-            return
-        notif_msg = ProxyNotif(req_id=req_id)
-        self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+            sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+
+    def _teardown_peer_connection(self, receiver_id: str) -> None:
+        """Drop a peer's REQ socket so the next send reconnects cleanly.
+
+        A REQ socket whose send/recv timed out is permanently
+        mid-cycle: every further send/recv would raise until the
+        socket is recreated. Rebuilding goes through
+        ``_ensure_peer_connection`` on the next transfer attempt.
+        """
+        sock = self.mem_alloc_sockets.pop(receiver_id, None)
+        if sock is not None:
+            try:
+                sock.close(linger=0)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        self.initialized_peers.discard(receiver_id)
+
+    def _remote_allocate(
+        self, receiver_id: str, alloc_request: AllocRequest
+    ) -> AscendAllocResponse:
+        """Wrap the base alloc RPC with timeout recovery.
+
+        Answers ``alloc_failed`` on timeout so the caller's existing
+        failure path (release pinned objs + per-peer backoff) handles
+        the dead peer without an exception unwinding the save path.
+        """
+        try:
+            return super()._remote_allocate(receiver_id, alloc_request)
+        except zmq.Again:
+            logger.warning(
+                "Alloc RPC to %s timed out; reconnecting on the next "
+                "attempt and reporting alloc_failed",
+                receiver_id,
+            )
+            self._teardown_peer_connection(receiver_id)
+            return AscendAllocResponse(
+                already_sent_indexes=[],
+                remote_buffer_uuids=[],
+                remote_indexes=[],
+                alloc_failed=True,
+            )
 
 
     def _batched_submit_put_task_push(
@@ -474,8 +523,6 @@ class AscendPDSenderMixin:
                 self._peer_alloc_backoff[receiver_id] = (
                     time.monotonic() + self._peer_alloc_backoff_ttl
                 )
-            if transfer_spec.is_last_prefill:
-                self.send_proxy_notification(transfer_spec.req_id)
             return
 
         already_sent_indexes = set(alloc_response.already_sent_indexes)
@@ -535,9 +582,6 @@ class AscendPDSenderMixin:
             len(mem_objs_to_send) * chunk_tokens,
             receiver_id,
         )
-
-        if transfer_spec.is_last_prefill:
-            self.send_proxy_notification(transfer_spec.req_id)
 
     def _batched_submit_put_task_pull(
         self,
@@ -610,8 +654,24 @@ class AscendPDSenderMixin:
         # where the listener thread processes a PullDoneSignal (from the
         # receiver) before we have narrowed the entry to pinned_objs only.
         side_channel = self.mem_alloc_sockets[receiver_id]
-        side_channel.send(msgspec.msgpack.encode(pull_notif))
-        ack_bytes = side_channel.recv()
+        try:
+            side_channel.send(msgspec.msgpack.encode(pull_notif))
+            ack_bytes = side_channel.recv()
+        except zmq.Again:
+            # Dead/slow receiver: tear the REQ socket down for a clean
+            # reconnect and fail this batch like an alloc failure.
+            self._teardown_peer_connection(receiver_id)
+            logger.warning(
+                "Pull RPC to %s timed out; releasing %d pinned MemObjs",
+                receiver_id,
+                len(memory_objs),
+            )
+            release_memory_objects(memory_objs)
+            with self._peer_alloc_backoff_lock:
+                self._peer_alloc_backoff[receiver_id] = (
+                    time.monotonic() + self._peer_alloc_backoff_ttl
+                )
+            return
         ack = msgspec.msgpack.decode(ack_bytes, type=AscendPDMsg)
         assert isinstance(ack, PullReadyDoneAck), (
             f"Expected PullReadyDoneAck, got {type(ack)}"
@@ -631,8 +691,6 @@ class AscendPDSenderMixin:
                 self._peer_alloc_backoff[receiver_id] = (
                     time.monotonic() + self._peer_alloc_backoff_ttl
                 )
-            if transfer_spec.is_last_prefill:
-                self.send_proxy_notification(transfer_spec.req_id)
             return
 
         # Release already-sent objects, pin the rest
@@ -690,6 +748,3 @@ class AscendPDSenderMixin:
                 "Pull mode: all objects already sent for pull_id %s.",
                 pull_id,
             )
-
-        if transfer_spec.is_last_prefill:
-            self.send_proxy_notification(transfer_spec.req_id)

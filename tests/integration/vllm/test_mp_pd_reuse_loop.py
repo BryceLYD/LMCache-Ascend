@@ -31,8 +31,6 @@ _PD_EXTRA = {
     "pd_peer_host": "localhost",
     "pd_peer_init_port": [7300],
     "pd_peer_alloc_port": [7400],
-    "pd_proxy_host": "localhost",
-    "pd_proxy_port": 7500,
     "chunk_size": 256,
 }
 

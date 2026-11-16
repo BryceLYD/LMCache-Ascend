@@ -2,11 +2,12 @@
 """Step 4 acceptance checks: the PD leg of the MP+PD connector.
 
 These tests run against the real upstream lmcache/vllm code (no NPU,
-no lmcache server, no live P/D pair): the scheduler-side pieces (发货单
-extraction, send-instruction computation) and the worker->scheduler
-observation path (metadata aggregation, ledger ``pd_tokens``) are
-exercised with fake trackers/adapters, following the repo's
-``object.__new__`` pattern (see test_handle_preemptions.py).
+no lmcache server, no live P/D pair): the scheduler-side pieces (spec
+self-build from peer config, send-instruction computation, the
+decoder's bounded pending wait) and the worker->scheduler observation
+path (metadata aggregation, ledger ``pd_tokens``) are exercised with
+fake trackers/adapters, following the repo's ``object.__new__``
+pattern (see test_handle_preemptions.py).
 
 The assembled ``PDEngine`` itself (AscendPDBackend, transfer channels)
 needs NPU and a live peer; it is covered by the 1p1d run on the env
@@ -26,8 +27,6 @@ _PD_EXTRA = {
     "pd_peer_host": "localhost",
     "pd_peer_init_port": [7300],
     "pd_peer_alloc_port": [7400],
-    "pd_proxy_host": "localhost",
-    "pd_proxy_port": 7500,
     "chunk_size": 256,
 }
 
@@ -89,29 +88,23 @@ def _vllm_config(extra, kv_role):
     )
 
 
-def _fake_request(req_id="r1", n_prompt=700, with_spec=True):
-    params = None
-    if with_spec:
-        params = {
-            "disagg_spec": {
-                "req_id": req_id,
-                "receiver_host": "localhost",
-                "receiver_init_port": [7300],
-                "receiver_alloc_port": [7400],
-            }
-        }
+def _fake_request(req_id="r1", n_prompt=700, with_spec=False):
+    # ``with_spec`` kept for signature stability: router-mode requests
+    # never carry transfer params; the field is inert.
     return SimpleNamespace(
         request_id=req_id,
         num_prompt_tokens=n_prompt,
         all_token_ids=list(range(n_prompt)),
         prompt_token_ids=list(range(n_prompt)),
-        kv_transfer_params=params,
+        kv_transfer_params=None,
         cache_salt="",
         status=None,
     )
 
 
-def _make_scheduler_connector(lookup_results=(0,)):
+def _make_scheduler_connector(
+    lookup_results=(0,), kv_role="kv_consumer", pd_enabled=False
+):
     stack = _import_stack()
     connector = object.__new__(stack.conn_cls)
     connector._ledgers = {}
@@ -122,7 +115,9 @@ def _make_scheduler_connector(lookup_results=(0,)):
     connector._pd_complete_logged = set()
     connector._pd_kv_caches = None
     connector._pd_arrived = set()
-    connector._pd_key_db = None
+    connector._pd_key_db = (
+        _FakeKeyDB(chunk_size=256) if pd_enabled else None
+    )
     connector._pd_chunk_size = 256
     connector._pd_load_issued = set()
     connector._pd_load_done = set()
@@ -134,6 +129,13 @@ def _make_scheduler_connector(lookup_results=(0,)):
     connector._pd_alloc_check_l1 = False
     connector._pd_l1_hash_algorithm = "blake3"
     connector._pd_save_policy = "both"
+    connector._pd_kv_role = kv_role
+    connector._pd_peer_host = "localhost" if pd_enabled else None
+    connector._pd_peer_init_port = [7300] if pd_enabled else None
+    connector._pd_peer_alloc_port = [7400] if pd_enabled else None
+    connector._pd_pending_timeout = 3.0
+    connector._pd_save_unfull_chunk = True
+    connector._pd_pending_since = {}
     connector._group_tokens_per_block = [16]
     connector.request_trackers = {}
     connector.scheduler_adapter = _FakeSchedulerAdapter(
@@ -147,7 +149,7 @@ def _make_scheduler_connector(lookup_results=(0,)):
     connector._vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16),
         kv_transfer_config=SimpleNamespace(
-            kv_role="kv_consumer", kv_connector_extra_config={}
+            kv_role=kv_role, kv_connector_extra_config={}
         ),
     )
     connector.lazy_offload = False
@@ -175,33 +177,41 @@ class _FakeKeyDB:
             i = e
 
 
-def test_extract_spec_from_kv_transfer_params():
-    stack = _import_stack()
+def test_spec_self_built_from_peer_config():
+    """Router mode: the producer derives the 发货单 from the static
+    pd_peer_* config — no per-request transfer params involved."""
+    connector, _ = _make_scheduler_connector(
+        kv_role="kv_producer", pd_enabled=True
+    )
     request = _fake_request()
-    spec = stack.pd_engine_mod.extract_pd_transfer_spec(request)
-    assert spec is not None
+    connector._pd_maybe_capture_spec(request)
+    spec = connector._pd_specs["r1"]
     assert spec.req_id == "r1"
     assert spec.receiver_host == "localhost"
     assert spec.receiver_init_port == [7300]
     assert spec.receiver_alloc_port == [7400]
     assert spec.num_prompt_tokens == 700
     assert spec.sent_end == 0
+    # Idempotent: a second capture does not reset sent_end.
+    spec.sent_end = 256
+    connector._pd_maybe_capture_spec(request)
+    assert connector._pd_specs["r1"].sent_end == 256
 
 
-def test_extract_spec_returns_none_when_absent_or_malformed():
-    stack = _import_stack()
-    plain = SimpleNamespace(
-        request_id="r2", num_prompt_tokens=8, kv_transfer_params=None
+def test_spec_not_built_on_consumer_or_unconfigured_pd():
+    connector, _ = _make_scheduler_connector(
+        kv_role="kv_consumer", pd_enabled=True
     )
-    assert stack.pd_engine_mod.extract_pd_transfer_spec(plain) is None
-    no_params = SimpleNamespace(request_id="r3", num_prompt_tokens=8)
-    assert stack.pd_engine_mod.extract_pd_transfer_spec(no_params) is None
-    broken = SimpleNamespace(
-        request_id="r4",
-        num_prompt_tokens=8,
-        kv_transfer_params={"disagg_spec": {"req_id": "r4"}},
+    consumer_req = _fake_request("c1")
+    connector._pd_maybe_capture_spec(consumer_req)
+    assert "c1" not in connector._pd_specs
+
+    unconfigured, _ = _make_scheduler_connector(
+        kv_role="kv_producer", pd_enabled=False
     )
-    assert stack.pd_engine_mod.extract_pd_transfer_spec(broken) is None
+    plain_req = _fake_request("p1")
+    unconfigured._pd_maybe_capture_spec(plain_req)
+    assert "p1" not in unconfigured._pd_specs
 
 
 def test_maybe_create_gating():
@@ -252,7 +262,9 @@ def _blocks_ns():
 
 
 def test_update_state_after_alloc_records_spec():
-    connector, _ = _make_scheduler_connector()
+    connector, _ = _make_scheduler_connector(
+        kv_role="kv_producer", pd_enabled=True
+    )
     request = _fake_request()
     connector.request_trackers["r1"] = _real_tracker(request)
     connector.update_state_after_alloc(request, _blocks_ns(), 0)
@@ -262,7 +274,9 @@ def test_update_state_after_alloc_records_spec():
 
 
 def test_send_instructions_mid_prefill_then_tail():
-    connector, _ = _make_scheduler_connector()
+    connector, _ = _make_scheduler_connector(
+        kv_role="kv_producer", pd_enabled=True
+    )
     request = _fake_request()
     connector.request_trackers["r1"] = _real_tracker(request)
     connector.update_state_after_alloc(request, _blocks_ns(), 0)
@@ -286,7 +300,9 @@ def test_send_instructions_mid_prefill_then_tail():
 
 
 def test_send_instructions_skip_multi_group():
-    connector, _ = _make_scheduler_connector()
+    connector, _ = _make_scheduler_connector(
+        kv_role="kv_producer", pd_enabled=True
+    )
     request = _fake_request()
     connector.request_trackers["r1"] = _real_tracker(request)
     connector.update_state_after_alloc(request, _blocks_ns(), 0)
@@ -300,7 +316,11 @@ def test_send_instructions_cover_l1_hit_prefix():
     """The shipment covers the L1-loaded prefix too (it lives in the
     paged pool just like computed tokens) — otherwise a producer-side
     L1 hit leaves the decoder with a recompute hole."""
-    connector, _ = _make_scheduler_connector(lookup_results=(768,))
+    connector, _ = _make_scheduler_connector(
+        lookup_results=(768,),
+        kv_role="kv_producer",
+        pd_enabled=True,
+    )
     request = _fake_request("hole", 917)
     connector.request_trackers["hole"] = _real_tracker(request)
     connector.update_state_after_alloc(request, _blocks_ns(), 0)
@@ -319,14 +339,16 @@ def test_send_instructions_cover_l1_hit_prefix():
     assert len(instrs) == 1
     assert (instrs[0].start, instrs[0].end) == (768, 917)
     assert instrs[0].is_last_prefill is True
-    assert connector._pd_specs["hole"].last_notified is True
+    assert connector._pd_specs["hole"].sent_end == 917
 
 
-def test_send_instructions_notify_only_when_nothing_left_to_ship():
-    """Prefill done, everything already shipped, gate never opened:
-    a notify-only instruction must still be emitted (exactly once) so
-    the disagg proxy lets the decode request through."""
-    connector, _ = _make_scheduler_connector()
+def test_send_instructions_nothing_left_to_ship():
+    """Prefill done, everything already shipped: no instruction is
+    emitted (the router gates the decode request on the prefill
+    response itself, so there is nothing to notify)."""
+    connector, _ = _make_scheduler_connector(
+        kv_role="kv_producer", pd_enabled=True
+    )
     request = _fake_request("gate", 700)
     connector.request_trackers["gate"] = _real_tracker(request)
     connector.update_state_after_alloc(request, _blocks_ns(), 0)
@@ -335,15 +357,10 @@ def test_send_instructions_notify_only_when_nothing_left_to_ship():
     spec = connector._pd_specs["gate"]
     spec.sent_end = 700
 
-    instrs = connector._pd_build_send_instructions()
-    assert len(instrs) == 1
-    assert instrs[0].notify_only is True
-    assert instrs[0].is_last_prefill is True
-    assert spec.last_notified is True
     assert connector._pd_build_send_instructions() == []
 
 
-def _pd_instr(stack, req_id="r1", is_last=False, notify_only=False):
+def _pd_instr(stack, req_id="r1", is_last=False):
     return stack.pd_engine_mod.PDSendInstruction(
         req_id=req_id,
         receiver_host="h",
@@ -355,71 +372,59 @@ def _pd_instr(stack, req_id="r1", is_last=False, notify_only=False):
         start=0,
         end=256,
         is_last_prefill=is_last,
-        notify_only=notify_only,
     )
 
 
-def test_send_instructions_l1_only_still_opens_gate():
-    """l1_only ships nothing through PD, but the proxy gate must still
-    open once the prefill phase is over (the decoder recomputes)."""
-    connector, _ = _make_scheduler_connector()
+def test_send_instructions_l1_only_ships_nothing():
+    """l1_only ships nothing through PD; the decoder recomputes and no
+    instruction is ever emitted."""
+    connector, _ = _make_scheduler_connector(
+        kv_role="kv_producer", pd_enabled=True
+    )
     connector._pd_save_policy = "l1_only"
     request = _fake_request("l1only", 700)
     connector.request_trackers["l1only"] = _real_tracker(request)
     connector.update_state_after_alloc(request, _blocks_ns(), 0)
     tracker = connector.request_trackers["l1only"]
 
-    # Mid-prefill: nothing shipped, gate stays closed.
     tracker.num_scheduled_tokens = 300
     assert connector._pd_build_send_instructions() == []
 
-    # Prefill over: the notify-only instruction opens the gate once.
     tracker.num_scheduled_tokens = 700
-    instrs = connector._pd_build_send_instructions()
-    assert len(instrs) == 1
-    assert instrs[0].notify_only is True
-    assert instrs[0].is_last_prefill is True
-    assert connector._pd_specs["l1only"].last_notified is True
+    tracker.allocated_block_ids = {0: list(range(44))}
     assert connector._pd_build_send_instructions() == []
 
 
-def test_execute_send_instructions_notify_only_opens_gate():
+def test_execute_send_instructions_runs_each_send():
     connector, stack = _make_scheduler_connector()
     connector._pd_engine = MagicMock()
-    connector._pd_kv_caches = []
-    instr = _pd_instr(stack, notify_only=True, is_last=True)
-    connector._pd_execute_send_instructions(
-        SimpleNamespace(pd_send_instructions=[instr])
-    )
-    connector._pd_engine.send_proxy_notification.assert_called_once_with("r1")
-    connector._pd_engine.execute_send.assert_not_called()
-
-
-def test_execute_send_instructions_failure_opens_gate():
-    """A failed last-chunk shipment must still open the proxy gate: the
-    decoder recomputes the missing range, but it can only start once
-    the notification arrives."""
-    connector, stack = _make_scheduler_connector()
-    connector._pd_engine = MagicMock()
-    connector._pd_engine.execute_send.side_effect = RuntimeError("boom")
     connector._pd_kv_caches = []
     instr = _pd_instr(stack, is_last=True)
     connector._pd_execute_send_instructions(
         SimpleNamespace(pd_send_instructions=[instr])
     )
-    connector._pd_engine.send_proxy_notification.assert_called_once_with("r1")
+    connector._pd_engine.execute_send.assert_called_once_with(
+        instr, []
+    )
 
 
-def test_execute_send_instructions_mid_failure_keeps_gate():
+def test_execute_send_instructions_failure_is_contained():
+    """A failed send is logged and contained: the receiver's bounded
+    pending wait expires and it recomputes the missing range — no
+    gate notification exists anymore (the router gates on the
+    prefill response)."""
     connector, stack = _make_scheduler_connector()
     connector._pd_engine = MagicMock()
     connector._pd_engine.execute_send.side_effect = RuntimeError("boom")
     connector._pd_kv_caches = []
-    instr = _pd_instr(stack, is_last=False)
-    connector._pd_execute_send_instructions(
-        SimpleNamespace(pd_send_instructions=[instr])
+    for is_last in (False, True):
+        instr = _pd_instr(stack, is_last=is_last)
+        connector._pd_execute_send_instructions(
+            SimpleNamespace(pd_send_instructions=[instr])
+        )
+    connector._pd_engine.execute_send.assert_called_with(
+        instr, []
     )
-    connector._pd_engine.send_proxy_notification.assert_not_called()
 
 
 def test_worker_metadata_aggregate_merges_pd_received():
@@ -486,11 +491,13 @@ def test_merged_lookup_pd_only_hit():
 
 
 def test_merged_lookup_round2_money_path():
-    """APC=512 | L1=1024 | PD arrived [1024,1536): three-way merge."""
+    """APC=512 | L1=1024 | PD arrived [1024,2048): three-way merge."""
     connector, stack = _make_scheduler_connector(
         lookup_results=(4 * 256,)
     )
-    _enable_pd_merge(connector, {"key-4", "key-5"})
+    _enable_pd_merge(
+        connector, {"key-4", "key-5", "key-6", "key-7"}
+    )
     request = _fake_request("money", 2048)
     result = connector.get_num_new_matched_tokens(request, 512)
     assert result == (1024, True)
@@ -499,10 +506,10 @@ def test_merged_lookup_round2_money_path():
     assert [(s.start, s.end, s.source) for s in ledger.segments] == [
         (0, 512, kv.APC),
         (512, 1024, kv.L1),
-        (1024, 1536, kv.PD_IN),
+        (1024, 2048, kv.PD_IN),
     ]
     assert [(s.start, s.end) for s in ledger.pd_receive_segments()] == [
-        (1024, 1536)
+        (1024, 2048)
     ]
 
 
@@ -523,8 +530,9 @@ def test_merged_lookup_pending_passes_none_through():
 
 
 def test_merged_lookup_matches_arrived_without_spec():
-    """The disagg proxy strips kv_transfer_params from decode requests,
-    so arrived chunks must match by content with no spec attached."""
+    """Decode legs carry no per-request transfer params (the router
+    forwards the original prompt); arrived chunks must match by
+    content alone."""
     connector, stack = _make_scheduler_connector(lookup_results=(0,))
     _enable_pd_merge(connector, {"key-0", "key-1", "key-2"})
     request = _fake_request("nospec", 700, with_spec=False)
@@ -558,17 +566,59 @@ def test_merged_lookup_fails_closed_after_reset():
     )
 
 
+def test_partial_arrival_waits_then_completes():
+    """Decoder pending (1/3): a partial PD arrival holds the lookup
+    (None, vLLM re-queries); the completed arrival releases the full
+    merged hit."""
+    connector, _ = _make_scheduler_connector(lookup_results=(0, 0))
+    _enable_pd_merge(connector, {"key-0"})
+    request = _fake_request("wait", 700)
+    assert connector.get_num_new_matched_tokens(request, 0) == (
+        None,
+        False,
+    )
+    assert "wait" in connector._pd_pending_since
+
+    # The rest of the transfer lands before the wait expires.
+    _enable_pd_merge(connector, {"key-0", "key-1", "key-2"})
+    assert connector.get_num_new_matched_tokens(request, 0) == (699, True)
+    assert "wait" not in connector._pd_pending_since
+
+
+def test_partial_arrival_times_out_to_merged_hit():
+    """Decoder pending (2/3): an expired wait fails closed — the lookup
+    stops holding and the arrived prefix still merges (the missing
+    range recomputes)."""
+    connector, _ = _make_scheduler_connector(lookup_results=(0,))
+    connector._pd_pending_timeout = 0.0
+    _enable_pd_merge(connector, {"key-0"})
+    request = _fake_request("late", 700)
+    assert connector.get_num_new_matched_tokens(request, 0) == (256, True)
+
+
+def test_direct_request_never_waits():
+    """Decoder pending (3/3): no PD arrival beyond L1 (a direct request
+    or a transfer that never started) never holds the lookup."""
+    connector, _ = _make_scheduler_connector(lookup_results=(0,))
+    _enable_pd_merge(connector, set())
+    request = _fake_request("direct", 700)
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert connector._pd_pending_since == {}
+
+
 def test_pd_build_load_instructions_once():
     connector, _ = _make_scheduler_connector(lookup_results=(4 * 256,))
-    _enable_pd_merge(connector, {"key-4", "key-5"})
+    _enable_pd_merge(
+        connector, {"key-4", "key-5", "key-6", "key-7"}
+    )
     request = _fake_request("money", 2048)
     connector.get_num_new_matched_tokens(request, 512)
     tracker = connector.request_trackers["money"]
-    tracker.num_scheduled_tokens = 1536
-    tracker.allocated_block_ids = {0: list(range(96))}
+    tracker.num_scheduled_tokens = 2048
+    tracker.allocated_block_ids = {0: list(range(128))}
     instructions = connector._pd_build_load_instructions()
     assert len(instructions) == 1
-    assert (instructions[0].start, instructions[0].end) == (1024, 1536)
+    assert (instructions[0].start, instructions[0].end) == (1024, 2048)
     assert connector._pd_build_load_instructions() == []
     connector.request_finished(request, [])
     assert "money" not in connector._pd_load_issued
@@ -626,7 +676,9 @@ def test_save_policy_validation():
 
 
 def test_l1_only_policy_skips_send_instructions():
-    connector, _ = _make_scheduler_connector()
+    connector, _ = _make_scheduler_connector(
+        kv_role="kv_producer", pd_enabled=True
+    )
     connector._pd_save_policy = "l1_only"
     request = _fake_request()
     connector.request_trackers["r1"] = _real_tracker(request)
@@ -670,17 +722,16 @@ def test_pd_only_policy_suppresses_l1_stores_and_restores():
         connector._get_connector_metadata = original_get
 
 
-def test_request_finished_returns_first_tok_for_disagg_prefill():
-    """The disagg proxy reads first_tok from the prefill response's
-    kv_transfer_params; the connector must supply it for disagg-routed
-    producer requests (the prefill generates exactly the first token)."""
-    stack = _import_stack()
-    connector, _ = _make_scheduler_connector()
-    connector._vllm_config.kv_transfer_config.kv_role = "kv_producer"
-    spec = stack.pd_engine_mod.extract_pd_transfer_spec(_fake_request())
-    connector._pd_specs["r1"] = spec
-
+def test_request_finished_passes_super_result_through():
+    """Router mode: no first_tok handshake exists — the prefill
+    response body is the router's gate, and the connector simply
+    returns the upstream result while dropping its bookkeeping."""
+    connector, _ = _make_scheduler_connector(
+        kv_role="kv_producer", pd_enabled=True
+    )
     request = SimpleNamespace(request_id="r1", output_token_ids=[4242])
+    connector._pd_specs["r1"] = SimpleNamespace(req_id="r1")
+    connector._pd_pending_since["r1"] = 1.0
 
     # Third Party
     from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
@@ -691,42 +742,6 @@ def test_request_finished_returns_first_tok_for_disagg_prefill():
         save, params = connector.request_finished(request, [])
 
     assert save is True
-    assert params["first_tok"] == 4242
+    assert params is None
     assert "r1" not in connector._pd_specs
-
-
-def test_request_finished_skips_first_tok_without_disagg_spec():
-    connector, _ = _make_scheduler_connector()
-    connector._vllm_config.kv_transfer_config.kv_role = "kv_producer"
-
-    request = SimpleNamespace(request_id="r9", output_token_ids=[7])
-
-    # Third Party
-    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
-
-    with patch.object(
-        LMCacheMPConnector, "request_finished", return_value=(True, None)
-    ):
-        _, params = connector.request_finished(request, [])
-
-    assert params is None
-
-
-def test_request_finished_skips_first_tok_on_consumer():
-    stack = _import_stack()
-    connector, _ = _make_scheduler_connector()
-    connector._vllm_config.kv_transfer_config.kv_role = "kv_consumer"
-    spec = stack.pd_engine_mod.extract_pd_transfer_spec(_fake_request())
-    connector._pd_specs["r1"] = spec
-
-    request = SimpleNamespace(request_id="r1", output_token_ids=[4242])
-
-    # Third Party
-    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
-
-    with patch.object(
-        LMCacheMPConnector, "request_finished", return_value=(True, None)
-    ):
-        _, params = connector.request_finished(request, [])
-
-    assert params is None
+    assert "r1" not in connector._pd_pending_since

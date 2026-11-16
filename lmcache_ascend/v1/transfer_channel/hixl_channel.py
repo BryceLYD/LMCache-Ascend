@@ -111,6 +111,11 @@ class HixlChannel(BaseMultiBufferChannel):
             zmq.REQ,
             "connect",
         )
+        # Bound handshake: a dead peer must fail the attempt (the
+        # caller retries on the next transfer) instead of wedging the
+        # engine's save path forever.
+        init_tmp_socket.setsockopt(zmq.RCVTIMEO, 10000)
+        init_tmp_socket.setsockopt(zmq.SNDTIMEO, 10000)
 
         # Step 1: exchange engine IDs
         init_req = HixlInitRequest(

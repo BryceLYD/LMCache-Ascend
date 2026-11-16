@@ -372,6 +372,11 @@ class MooncakeChannel(BaseMultiBufferChannel):
             zmq.REQ,
             "connect",
         )
+        # Bound handshake: a dead peer must fail the connection attempt
+        # (the caller retries on the next transfer) instead of wedging
+        # the engine's save path forever.
+        init_tmp_socket.setsockopt(zmq.RCVTIMEO, 10000)
+        init_tmp_socket.setsockopt(zmq.SNDTIMEO, 10000)
         try:
             # Step 1: exchange engine names
             init_req = MooncakeInitRequest(
