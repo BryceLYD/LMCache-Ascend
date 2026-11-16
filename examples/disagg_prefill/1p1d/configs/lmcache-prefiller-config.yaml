@@ -18,3 +18,8 @@ pd_buffer_device: "npu" # Use NPU memory for buffer
 # prefill would not send the unfull chunk to the decoder.
 # setting this to true will ensure the pd transfer occurs even for small prompts.
 save_unfull_chunk: True # Save unfull chunk to disk,
+
+# P-side L1 store runs on a background worker (never blocks the engine);
+# the PD send still completes synchronously before the prefill response,
+# so the store-through invariant is unchanged.
+store_async: True
