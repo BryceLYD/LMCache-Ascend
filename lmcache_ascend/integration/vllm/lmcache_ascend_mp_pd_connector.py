@@ -382,6 +382,18 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         kvcaches = self._pd_kv_caches
         if kvcaches is None:
             return
+        # Which requests have an upstream L1 RETRIEVE in flight this
+        # step: the retrieve completion reports finished_recving and
+        # releases the request from WAITING_FOR_REMOTE_KVS, so the PD
+        # load of the SAME request must not report a second recving
+        # (the request is already RUNNING by the time the incremental
+        # PD chunks land -- vLLM asserts recving requests are WAITING
+        # or finished and kills the engine otherwise).
+        l1_retrieve_reqs = {
+            req_meta.request_id
+            for req_meta in getattr(metadata, "requests", None) or []
+            if getattr(req_meta, "direction", None) == "RETRIEVE"
+        }
         for instr in getattr(metadata, "pd_load_instructions", None) or []:
             try:
                 failed, landed_end = engine.execute_pd_load(
@@ -393,7 +405,12 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     instr.request_id, 0
                 ):
                     self._pd_loaded_pending[instr.request_id] = landed_end
-                self._pd_note_load_done(instr.request_id)
+                self._pd_note_load_done(
+                    instr.request_id,
+                    suppress_recving=(
+                        instr.request_id in l1_retrieve_reqs
+                    ),
+                )
             except Exception:
                 logger.exception(
                     "PD load failed for req %s [%d,%d); marking its "
@@ -402,30 +419,43 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     instr.start,
                     instr.end,
                 )
-                self._pd_note_load_done(instr.request_id)
+                self._pd_note_load_done(
+                    instr.request_id,
+                    suppress_recving=(
+                        instr.request_id in l1_retrieve_reqs
+                    ),
+                )
                 for pos in range(instr.start, instr.end):
                     idx = pos // instr.block_size
                     if 0 <= idx < len(instr.block_ids):
                         self._pd_failed_blocks.add(instr.block_ids[idx])
 
-    def _pd_note_load_done(self, request_id: str) -> None:
-        """Report a PD load completion to vLLM at most once per request.
+    def _pd_note_load_done(
+        self, request_id: str, suppress_recving: bool = False
+    ) -> None:
+        """Record a PD load completion; report recving only when the PD
+        load is the request's sole release signal.
 
         vLLM's ``_update_from_kv_xfer_finished`` requires a
         ``finished_recving`` request to be either still in
         WAITING_FOR_REMOTE_KVS (the signal releases it for scheduling)
-        or already finished (the signal frees blocks). The FIRST PD load
-        of a request completes while it is WAITING, so reporting it
-        releases the request correctly. Follow-up loads of the same
-        request (incremental chunks arriving after the request was
-        released) land while it is RUNNING, and reporting those crashes
-        the scheduler with an assertion. The store-through accounting
-        for follow-up loads flows through ``pd_loaded`` instead, so
-        nothing is lost by suppressing the repeat reports.
+        or already finished. Two independent channels can release a
+        request: the upstream L1 retrieve (an async load from the
+        decoder's own server) and the PD load (chunks arriving from the
+        producer). When BOTH hit, the L1 retrieve completes first
+        (it was submitted at lookup time), releases the request, and
+        the PD load then lands while the request is RUNNING -- reporting
+        its completion crashes the scheduler. So the PD load reports
+        recving only when no upstream retrieve is carrying the release
+        signal for the same request (pure-PD cold start), and at most
+        once per request. The store-through accounting flows through
+        ``pd_loaded`` in every case, so nothing is lost.
         """
         if request_id in self._pd_recv_reported:
             return
         self._pd_recv_reported.add(request_id)
+        if suppress_recving:
+            return
         self._pd_load_done.add(request_id)
 
     def get_finished(

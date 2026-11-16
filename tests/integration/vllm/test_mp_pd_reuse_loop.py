@@ -371,6 +371,26 @@ def test_pd_load_done_reported_once_per_request():
     assert connector._pd_load_done == {"r1"}
 
 
+def test_pd_load_done_suppressed_when_l1_retrieve_carries_release():
+    """Dual-channel release: when the request has an upstream L1
+    RETRIEVE in flight (mixed L1+PD hit), the retrieve completion is
+    the recving signal that releases the request; the PD load of the
+    same request must not report a second recving -- it lands after
+    the request is already RUNNING and crashes the scheduler."""
+    stack = _import_stack()
+    connector = _make_connector(stack)
+    # L1 retrieve in flight for r1: PD load must not report recving.
+    connector._pd_note_load_done("r1", suppress_recving=True)
+    assert connector._pd_load_done == set()
+    assert "r1" in connector._pd_recv_reported  # guard consumed
+    # Pure-PD request r2 (no L1 retrieve): PD load IS the release.
+    connector._pd_note_load_done("r2", suppress_recving=False)
+    assert connector._pd_load_done == {"r2"}
+    # A PD load without the suppress flag (default) reports.
+    connector._pd_note_load_done("r3")
+    assert connector._pd_load_done == {"r2", "r3"}
+
+
 def test_get_finished_retires_recv_reported_guard():
     """The once-per-request guard lives on the worker, request_finished
     only cleans the scheduler half (another process): get_finished must
