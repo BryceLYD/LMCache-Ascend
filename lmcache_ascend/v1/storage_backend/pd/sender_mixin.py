@@ -311,10 +311,29 @@ class AscendPDSenderMixin:
         self, receiver_id: str, alloc_request: AllocRequest
     ) -> AscendAllocResponse:
         """Send an ``AllocRequest`` and decode the response as
-        ``AscendAllocResponse`` (with UUID-based buffer refs)."""
+        ``AscendAllocResponse`` (with UUID-based buffer refs).
+
+        A send/recv timeout answers ``alloc_failed`` so the caller's
+        failure path (release pinned objs + per-peer backoff) handles
+        the dead peer without an exception unwinding the save path.
+        """
         side_channel = self.mem_alloc_sockets[receiver_id]
-        side_channel.send(msgspec.msgpack.encode(alloc_request))
-        msg = side_channel.recv()
+        try:
+            side_channel.send(msgspec.msgpack.encode(alloc_request))
+            msg = side_channel.recv()
+        except zmq.Again:
+            logger.warning(
+                "Alloc RPC to %s timed out; reconnecting on the next "
+                "attempt and reporting alloc_failed",
+                receiver_id,
+            )
+            self._teardown_peer_connection(receiver_id)
+            return AscendAllocResponse(
+                already_sent_indexes=[],
+                remote_buffer_uuids=[],
+                remote_indexes=[],
+                alloc_failed=True,
+            )
         alloc_response = msgspec.msgpack.decode(msg, type=AscendPDMsg)
         assert isinstance(alloc_response, AscendAllocResponse), (
             f"Expected AscendAllocResponse, got {type(alloc_response)}"
@@ -433,32 +452,6 @@ class AscendPDSenderMixin:
             except Exception:  # noqa: BLE001 - best-effort teardown
                 pass
         self.initialized_peers.discard(receiver_id)
-
-    def _remote_allocate(
-        self, receiver_id: str, alloc_request: AllocRequest
-    ) -> AscendAllocResponse:
-        """Wrap the base alloc RPC with timeout recovery.
-
-        Answers ``alloc_failed`` on timeout so the caller's existing
-        failure path (release pinned objs + per-peer backoff) handles
-        the dead peer without an exception unwinding the save path.
-        """
-        try:
-            return super()._remote_allocate(receiver_id, alloc_request)
-        except zmq.Again:
-            logger.warning(
-                "Alloc RPC to %s timed out; reconnecting on the next "
-                "attempt and reporting alloc_failed",
-                receiver_id,
-            )
-            self._teardown_peer_connection(receiver_id)
-            return AscendAllocResponse(
-                already_sent_indexes=[],
-                remote_buffer_uuids=[],
-                remote_indexes=[],
-                alloc_failed=True,
-            )
-
 
     def _batched_submit_put_task_push(
         self,
