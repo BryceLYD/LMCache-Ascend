@@ -329,7 +329,24 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
     def wait_for_save(self):
         self._pd_maybe_suppress_l1_stores()
         try:
+            md = self._get_connector_metadata()
+            for meta in getattr(md, "requests", None) or []:
+                if getattr(meta, "direction", None) == "STORE":
+                    op = getattr(meta, "op", None)
+                    _pd_trace(
+                        "worker-save-sees STORE req=%s start=%s end=%s "
+                        "n_block_groups=%s",
+                        meta.request_id,
+                        getattr(op, "start", None),
+                        getattr(op, "end", None),
+                        len(getattr(op, "block_ids", []) or []),
+                    )
             super().wait_for_save()
+            adapter = getattr(self, "worker_adapter", None)
+            _pd_trace(
+                "worker-save-done store_futures=%s",
+                list(getattr(adapter, "store_futures", {}) or {}),
+            )
         finally:
             self._pd_restore_l1_stores()
         if self._pd_engine is None or self._pd_kv_caches is None:
@@ -582,7 +599,10 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         out.pd_received = self._pd_received
         out.pd_arrived_keys = self._pd_arrived_pending
         _pd_trace(
-            "worker-meta pd_loaded_pending=%s", self._pd_loaded_pending
+            "worker-meta pd_loaded_pending=%s stores_done=%s failed=%s",
+            self._pd_loaded_pending,
+            sorted(getattr(base, "completed_store_requests", {}) or {}),
+            sorted(getattr(base, "failed_store_requests", set()) or []),
         )
         out.pd_loaded = self._pd_loaded_pending
         self._pd_received = {}
