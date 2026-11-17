@@ -7,7 +7,9 @@ import threading
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
+from lmcache.v1.memory_allocators.mixed_memory_allocator import (
+    MixedMemoryAllocator,
+)
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.rpc_utils import get_zmq_socket
 from lmcache.v1.transfer_channel.transfer_utils import (
@@ -24,7 +26,11 @@ import lmcache_ascend.hccl_npu_comms as hcomm
 
 # Local
 from .base_channel import BaseMultiBufferChannel
-from .buffer_config import BufferConfig, BufferType, RemotePeerBufferList
+from .buffer_config import (
+    BufferConfig,
+    BufferType,
+    RemotePeerBufferList,
+)
 from .hccl_agent import HcclAgentWrapper
 from .hccl_metadata import (
     decode_client_meta,
@@ -347,11 +353,6 @@ class HcclChannel(BaseMultiBufferChannel):
             zmq.REQ,
             "connect",
         )
-        # Bound handshake: a dead peer must fail the attempt (the
-        # caller retries on the next transfer) instead of wedging the
-        # engine's save path forever.
-        init_tmp_socket.setsockopt(zmq.RCVTIMEO, 10000)
-        init_tmp_socket.setsockopt(zmq.SNDTIMEO, 10000)
 
         hccl_init_req = HcclInitRequest(
             local_id=local_id,
