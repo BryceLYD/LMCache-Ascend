@@ -648,7 +648,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             load_instructions = self._pd_build_load_instructions()
             if load_instructions:
                 metadata.pd_load_instructions = load_instructions
-            self._pd_inject_store_through(metadata)
+            self._pd_inject_store_through(metadata, scheduler_output)
         return metadata
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -996,7 +996,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 break
         return reached
 
-    def _pd_inject_store_through(self, metadata) -> None:
+    def _pd_inject_store_through(self, metadata, scheduler_output) -> None:
         """Persist the PD-landed prefix into the decoder's L1 (Step 6).
 
         Upstream never stores from the decoder: ``_can_store`` is
@@ -1051,6 +1051,19 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     "MP+PD store-through: req %s landed=%d but no tracker",
                     req_id,
                     self._pd_landed[req_id],
+                )
+                continue
+            # Only ride steps that actually execute this request.
+            # Idle-loop builds never dispatch to the workers, and an
+            # append there advances the watermark on a store that is
+            # never shipped -- the extension chunk is then lost while
+            # re-emission stays suppressed as "already stored".
+            scheduled = getattr(
+                scheduler_output, "num_scheduled_tokens", None
+            )
+            if (scheduled or {}).get(req_id, 0) <= 0:
+                _pd_trace(
+                    "inject-defer req=%s not scheduled this step", req_id
                 )
                 continue
             landed = self._pd_landed[req_id]
