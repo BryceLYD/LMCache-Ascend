@@ -284,13 +284,22 @@ class AscendPDSenderMixin:
                 peer_id=receiver_id,
                 peer_init_url=f"{receiver_host}:{receiver_init_port}",
             )
-            self.mem_alloc_sockets[receiver_id] = get_zmq_socket(
+            sock = get_zmq_socket(
                 self.zmq_context,
                 f"{receiver_host}:{receiver_alloc_port}",
                 "tcp",
                 zmq.REQ,
                 "connect",
             )
+            # Bound the alloc RPC: a dead peer must surface as a
+            # timeout (teardown + alloc_failed backoff) instead of
+            # wedging the engine's save path forever.
+            timeout_ms = int(
+                getattr(self._config, "pd_alloc_rpc_timeout_ms", 10000)
+            )
+            sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+            self.mem_alloc_sockets[receiver_id] = sock
             self.initialized_peers.add(receiver_id)
         logger.info(
             "PD peer connection established: %s (channel handshake + "
@@ -408,33 +417,6 @@ class AscendPDSenderMixin:
             self._batched_submit_put_task_pull(keys, memory_objs, transfer_spec)
         else:
             self._batched_submit_put_task_push(keys, memory_objs, transfer_spec)
-
-    def _ensure_peer_connection(
-        self,
-        receiver_id: str,
-        receiver_host: str,
-        receiver_init_port: int,
-        receiver_alloc_port: int,
-    ) -> None:
-        """Extend the base connection setup with REQ-socket timeouts.
-
-        The alloc REQ socket otherwise blocks forever on a dead peer,
-        wedging the engine's save path. With the timeout a dead peer
-        surfaces as an alloc failure instead (release + peer backoff).
-        """
-        super()._ensure_peer_connection(
-            receiver_id=receiver_id,
-            receiver_host=receiver_host,
-            receiver_init_port=receiver_init_port,
-            receiver_alloc_port=receiver_alloc_port,
-        )
-        sock = self.mem_alloc_sockets.get(receiver_id)
-        if sock is not None:
-            timeout_ms = int(
-                getattr(self._config, "pd_alloc_rpc_timeout_ms", 10000)
-            )
-            sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
-            sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
 
     def _teardown_peer_connection(self, receiver_id: str) -> None:
         """Drop a peer's REQ socket so the next send reconnects cleanly.
