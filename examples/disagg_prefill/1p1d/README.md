@@ -90,19 +90,13 @@ python \
 Launch proxy server to coordinate prefill and decode
 
 ```bash
-python3 /workspace/LMCache/examples/disagg_prefill/disagg_proxy_server.py \
+python3 /workspace/LMCache-Ascend/examples/disagg_prefill/pd_proxy.py \
   --host localhost \
   --port 9100 \
   --prefiller-host localhost \
   --prefiller-port 7100 \
-  --num-prefillers 1 \
   --decoder-host localhost \
-  --decoder-port 7200  \
-  --decoder-init-port "7300,7301" \
-  --decoder-alloc-port "7400,7401" \
-  --proxy-host localhost \
-  --proxy-port 7500 \
-  --num-decoders 1
+  --decoder-port 7200
 ```
 
 Send request to engine 1
