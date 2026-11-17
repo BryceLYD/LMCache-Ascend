@@ -85,6 +85,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _pd_trace(msg: str, *args) -> None:
+    """Temporary raw-file tracing for the store-through bring-up.
+
+    Bypasses the logging pipeline entirely (scheduler-process logging
+    setups can swallow LMCache lines); remove once the store-through
+    chain is verified in the field.
+    """
+    try:
+        # Standard
+        import os
+        import time
+
+        line = msg % args if args else msg
+        with open("/tmp/pd_trace.log", "a", encoding="utf-8") as f:
+            f.write(f"[{time.time():.3f}] pid={os.getpid()} {line}\n")
+    except Exception:  # noqa: BLE001 - tracing must never break flow
+        pass
+
+
 class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
     """Monolithic connector combining MP cache and PD transfer.
 
@@ -424,6 +443,12 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 )
                 if failed:
                     self._pd_failed_blocks.update(failed)
+                _pd_trace(
+                    "worker-load req=%s landed_end=%d failed=%s",
+                    instr.request_id,
+                    landed_end,
+                    len(failed) if failed else 0,
+                )
                 if landed_end > self._pd_loaded_pending.get(
                     instr.request_id, 0
                 ):
@@ -556,6 +581,9 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         )
         out.pd_received = self._pd_received
         out.pd_arrived_keys = self._pd_arrived_pending
+        _pd_trace(
+            "worker-meta pd_loaded_pending=%s", self._pd_loaded_pending
+        )
         out.pd_loaded = self._pd_loaded_pending
         self._pd_received = {}
         self._pd_arrived_pending = []
@@ -607,12 +635,17 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         super().update_connector_output(connector_output)
         meta = getattr(connector_output, "kv_connector_worker_meta", None)
         if not isinstance(meta, MPPDWorkerMetadata):
+            _pd_trace(
+                "sched-output meta is %s (NOT MPPDWorkerMetadata)",
+                type(meta).__name__,
+            )
             return
         if meta.pd_arrived_keys:
             self._pd_arrived.update(meta.pd_arrived_keys)
         for req_id, landed in (getattr(meta, "pd_loaded", None) or {}).items():
             if landed > self._pd_landed.get(req_id, 0):
                 self._pd_landed[req_id] = landed
+                _pd_trace("sched-ingest req=%s landed=%d", req_id, landed)
                 logger.debug(
                     "MP+PD store-through: req %s landed prefix is now %d "
                     "tokens",
@@ -969,6 +1002,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         """
         if not self._pd_store_through:
             return
+        _pd_trace("inject-entry landed_map=%s", self._pd_landed)
         if not self._pd_landed:
             logger.debug(
                 "MP+PD store-through: landed map empty this step"
@@ -988,6 +1022,11 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         for req_id in list(self._pd_landed):
             tracker = trackers.get(req_id)
             if tracker is None:
+                _pd_trace(
+                    "inject-skip req=%s no tracker (landed=%d)",
+                    req_id,
+                    self._pd_landed[req_id],
+                )
                 logger.debug(
                     "MP+PD store-through: req %s landed=%d but no tracker",
                     req_id,
@@ -1009,6 +1048,14 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             start = tracker.num_stored_tokens
             num_chunks = (store_end - start) // mp_chunk
             if num_chunks <= 0:
+                _pd_trace(
+                    "inject-skip req=%s landed=%d store_end=%d start=%d "
+                    "no full chunk",
+                    req_id,
+                    landed,
+                    store_end,
+                    start,
+                )
                 # Guard, not just tracing: a later-resolved L1 lookup can
                 # push num_stored_tokens past this landed floor, making
                 # num_chunks negative -- falling through would emit a
@@ -1060,6 +1107,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 # the plain list without the helper.
                 metadata.requests.append(store_meta)
             tracker.increase_num_stored_tokens(end - start)
+            _pd_trace("inject-STORE req=%s [%d,%d)", req_id, start, end)
             logger.info(
                 "MP+PD store-through: storing req %s [%d,%d) from the "
                 "PD-landed prefix",
