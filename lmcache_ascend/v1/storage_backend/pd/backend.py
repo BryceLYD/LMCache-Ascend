@@ -29,6 +29,7 @@ import torch_npu  # noqa: F401
 import zmq
 
 # First Party
+from lmcache_ascend.v1.mp_pd.group_geometry import KVGroupGeometry
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 from lmcache_ascend.v1.rpc_utils import _find_free_port
 from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import AscendPDReceiverMixin
@@ -52,16 +53,25 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
       :func:`lmcache_ascend.v1.transfer_channel.CreateTransferChannel`
       with both CPU and NPU buffers registered (multi-buffer pattern),
     * use UUID-based buffer references in alloc responses and transfer specs
-      (required by the channel's ``_resolve_remote_addrs``).
+      (required by the channel's ``_resolve_remote_addrs``),
+    * accept per-engine-group storage geometries (hybrid models):
+      every page then holds one chunk of ALL groups concatenated
+      (upstream ``get_size_bytes`` sums a shape list); ``None`` keeps
+      the legacy single-shape metadata path.
     """
 
     def __init__(
         self,
         config: LMCacheEngineConfig,
         metadata: LMCacheMetadata,
+        group_geometries: Optional[list[KVGroupGeometry]] = None,
     ):
         self.running = True
         self.tp_rank = metadata.worker_id
+        # Per-engine-group storage geometries (hybrid models). Read by
+        # initialize_allocator and the shape bookkeeping below; None
+        # keeps the legacy single-shape metadata path.
+        self.group_geometries = group_geometries
 
         # Optional L1 residency oracle (receiver only). Injected by the
         # MP+PD connector after assembly (see PDEngine.attach_l1_oracle);
@@ -185,8 +195,12 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         # Cache metadata for proxy creation on receiver side
         self._metadata = metadata
         self._fmt = resolve_memory_format(metadata.use_mla)
-        self._kv_shapes = [torch.Size(metadata.kv_shape)]
-        self._kv_dtypes = [metadata.kv_dtype]
+        if self.group_geometries is not None:
+            self._kv_shapes = [group.shape for group in self.group_geometries]
+            self._kv_dtypes = [group.dtype for group in self.group_geometries]
+        else:
+            self._kv_shapes = [torch.Size(metadata.kv_shape)]
+            self._kv_dtypes = [metadata.kv_dtype]
 
     def initialize_allocator(
         self, config: LMCacheEngineConfig, metadata: LMCacheMetadata
@@ -197,8 +211,12 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
 
         paged_mem_allocator = PagedCpuGpuMemoryAllocator()
         fmt = resolve_memory_format(metadata.use_mla)
-        sizes = [torch.Size(metadata.kv_shape)]
-        dtypes = [metadata.kv_dtype]
+        if self.group_geometries is not None:
+            sizes = [group.shape for group in self.group_geometries]
+            dtypes = [group.dtype for group in self.group_geometries]
+        else:
+            sizes = [torch.Size(metadata.kv_shape)]
+            dtypes = [metadata.kv_dtype]
         total_size = get_size_bytes(sizes, dtypes)
 
         if self.pd_config.buffer_device.startswith("npu"):

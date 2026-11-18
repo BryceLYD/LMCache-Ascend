@@ -553,7 +553,9 @@ class PDEngine:
             kv_connector_extra_config=self._extra,
         )
         self.metadata = metadata
-        self.backend = AscendPDBackend(self._config, metadata)
+        self.backend = AscendPDBackend(
+            self._config, metadata, group_geometries=geometries
+        )
         if self._l1_oracle is not None:
             self.backend.l1_oracle = self._l1_oracle
         self.token_db, self.chunk_size = build_pd_chunk_db(
