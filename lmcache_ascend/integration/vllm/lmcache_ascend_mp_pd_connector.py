@@ -1119,10 +1119,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             tracker = trackers.get(req_id)
             if tracker is None:
                 continue
-            # Landing uses the primary (attention) group's blocks for
-            # now; recurrent-group landing arrives with the hybrid
-            # receiver-side scatter.
-            block_ids, _group_block_ids = self._group_block_ids(
+            block_ids, group_block_ids = self._group_block_ids(
                 tracker.allocated_block_ids
             )
             if block_ids is None:
@@ -1136,6 +1133,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     request_id=req_id,
                     token_ids=tracker.get_token_ids(),
                     block_ids=block_ids,
+                    group_block_ids=group_block_ids,
                     block_size=block_size,
                     start=start,
                     end=end,

@@ -170,6 +170,10 @@ class PDLoadInstruction:
     block_size: int
     start: int
     end: int
+    # Per-engine-group block ids (hybrid models), mirroring
+    # PDSendInstruction; ``block_ids`` above stays the primary
+    # (attention) group. None keeps the single-group behavior.
+    group_block_ids: Optional[dict] = None
 
 
 def _key_str(key) -> str:
@@ -618,7 +622,7 @@ class PDEngine:
 
         token_dim = self.fmt.token_dim() if self.fmt is not None else 2
         attn_group, rec_group, rec_block_ids = self._resolve_group_layout(
-            instr
+            instr.req_id, instr.group_block_ids
         )
 
         objs: list = []
@@ -726,14 +730,16 @@ class PDEngine:
     # Receiver (D side)
     # ------------------------------------------------------------------
 
-    def _resolve_group_layout(self, instr: PDSendInstruction) -> tuple:
+    def _resolve_group_layout(
+        self, req_id: str, group_block_ids: Optional[dict]
+    ) -> tuple:
         """Resolve (attention group, recurrent group, recurrent blocks).
 
         Single-group models return ``(attn, None, None)`` so the legacy
         metadata path runs unchanged. For hybrid sends the recurrent
-        group's vLLM block ids come from ``instr.group_block_ids`` keyed
-        by vLLM group index; the index is verified against the engine's
-        KV cache config (layer-name membership) and falls back to the
+        group's vLLM block ids come from ``group_block_ids`` keyed by
+        vLLM group index; the index is verified against the engine's KV
+        cache config (layer-name membership) and falls back to the
         single non-primary group.
         """
         geometries = self.kv_group_geometries or []
@@ -742,10 +748,10 @@ class PDEngine:
         if attn_group is None or rec_group is None:
             return attn_group, None, None
 
-        group_block_ids = instr.group_block_ids or {}
+        group_block_ids = group_block_ids or {}
         if len(group_block_ids) < 2:
             raise ValueError(
-                f"PD hybrid send for req {instr.req_id}: instruction "
+                f"PD hybrid send for req {req_id}: instruction "
                 f"carries {len(group_block_ids)} block-id groups; the "
                 "recurrent group has no block ids"
             )
@@ -869,6 +875,9 @@ class PDEngine:
                 instr.request_id,
             )
             return list(instr.block_ids), instr.start
+        attn_group, rec_group, rec_block_ids = self._resolve_group_layout(
+            instr.request_id, instr.group_block_ids
+        )
         keys: list = []
         starts: list = []
         ends: list = []
@@ -921,16 +930,33 @@ class PDEngine:
                 slot_mapping = slot_mapping.to("npu", non_blocking=True)
             except Exception:
                 pass
+            scatter_kvcaches = kvcaches
+            if rec_group is not None:
+                # The NPU connector's pointer table is built from
+                # attention entries only; recurrent pools are scattered
+                # below as opaque page bytes.
+                scatter_kvcaches = [
+                    kvcaches[i] for i in attn_group.layer_indices
+                ]
             result = self.npu_connector.batched_to_gpu(
                 objs,
                 copy_starts,
                 copy_ends,
-                kvcaches=kvcaches,
+                kvcaches=scatter_kvcaches,
                 slot_mapping=slot_mapping,
             )
             if result is not None:
                 for _ in result:
                     pass
+            if rec_group is not None:
+                self._scatter_state_pages(
+                    objs,
+                    copy_ends,
+                    kvcaches,
+                    rec_group,
+                    rec_block_ids,
+                    instr.block_size,
+                )
             try:
                 torch.npu.synchronize()
             except Exception:
@@ -948,6 +974,40 @@ class PDEngine:
             len(failed_blocks) > 0 and 1 or 0,
         )
         return sorted(failed_blocks), landed_end
+
+    def _scatter_state_pages(
+        self,
+        objs: list,
+        ends: list,
+        kvcaches,
+        rec_group,
+        rec_block_ids,
+        block_size: int,
+    ) -> None:
+        """Copy each boundary's recurrent state page from the combined
+        object's tail slice into the mamba pool slot (opaque bytes).
+
+        Mirrors the sender's ``_gather_state_pages``: the page holds
+        the state after the block covering the chunk's last token, so
+        the destination block index is ``(end - 1) // block_size``.
+        """
+        if not rec_block_ids:
+            raise ValueError(
+                "PD hybrid load: no recurrent block ids on a hybrid "
+                "instruction"
+            )
+        page_views = [
+            flat_state_page_view(kvcaches[i], rec_group.page_size_bytes)
+            for i in rec_group.layer_indices
+        ]
+        page_bytes = rec_group.page_size_bytes
+        for obj, end in zip(objs, ends, strict=False):
+            blk = rec_block_ids[(end - 1) // block_size]
+            attn_bytes = obj.tensor.numel() * obj.tensor.element_size()
+            base = attn_bytes
+            for view in page_views:
+                view[blk].copy_(obj.raw_data[base : base + page_bytes])
+                base += page_bytes
 
     def attach_l1_oracle(self, oracle: Optional["L1QueryOracle"]) -> None:
         """Inject the L1 residency oracle (receiver only).
