@@ -367,6 +367,7 @@ class AscendPDSenderMixin:
 
         token_ids = getattr(transfer_spec, "token_ids", None)
         if token_ids:
+            meta = mem_objs[0].meta
             return AscendAllocRequest(
                 keys=str_keys,
                 fmt=fmt.value,
@@ -375,6 +376,10 @@ class AscendPDSenderMixin:
                 last_chunk_toks=last_chunk_toks,
                 token_ids=list(token_ids),
                 token_start=int(getattr(transfer_spec, "start", 0)),
+                shapes=[list(s) for s in (meta.shapes or ())],
+                dtypes=[
+                    TORCH_DTYPE_TO_STR_DTYPE[d] for d in (meta.dtypes or ())
+                ],
             )
         return AllocRequest(
             keys=str_keys,
@@ -622,6 +627,11 @@ class AscendPDSenderMixin:
             last_chunk_toks=last_chunk_toks,
             token_ids=list(getattr(transfer_spec, "token_ids", None) or []),
             token_start=int(getattr(transfer_spec, "start", 0)),
+            shapes=[list(s) for s in (memory_objs[0].meta.shapes or ())],
+            dtypes=[
+                TORCH_DTYPE_TO_STR_DTYPE[d]
+                for d in (memory_objs[0].meta.dtypes or ())
+            ],
         )
 
         # Send PullReadyNotif and receive ack.

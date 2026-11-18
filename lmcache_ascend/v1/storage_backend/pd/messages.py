@@ -30,10 +30,17 @@ class AscendAllocRequest(AllocRequest):
     token position of the first key's chunk. Both default so older
     senders keep decoding; a request without tokens simply skips the
     L1 check (fail-open, same behavior as before).
+
+    ``shapes`` / ``dtypes`` carry the per-group geometry for hybrid
+    models: one combined object per chunk, every group's shape and
+    dtype in group order (attention first). Empty lists keep the
+    single-shape legacy fields.
     """
 
     token_ids: list[int] = []
     token_start: int = 0
+    shapes: list[list[int]] = []
+    dtypes: list[str] = []
 
 
 class AscendAllocResponse(AllocResponse):
@@ -63,6 +70,10 @@ class PullReadyNotif(msgspec.Struct, tag=True):
 
     ``token_ids`` / ``token_start`` mirror :class:`AscendAllocRequest`:
     the token context for the receiver's L1 residency check.
+
+    ``shapes`` / ``dtypes`` mirror :class:`AscendAllocRequest` too:
+    the per-group geometry of one combined object per chunk (hybrid
+    models); empty lists keep the single-shape legacy fields.
     """
 
     pull_id: str  # Unique ID for this pull batch
@@ -77,6 +88,8 @@ class PullReadyNotif(msgspec.Struct, tag=True):
     last_chunk_toks: int
     token_ids: list[int] = []
     token_start: int = 0
+    shapes: list[list[int]] = []
+    dtypes: list[str] = []
 
 
 class PullReadyDoneAck(msgspec.Struct, tag=True):
