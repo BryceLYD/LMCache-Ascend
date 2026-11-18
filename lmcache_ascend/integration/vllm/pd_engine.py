@@ -105,6 +105,11 @@ class PDSendInstruction:
     start: int
     end: int
     is_last_prefill: bool = False
+    # Per-engine-group block ids (hybrid models): engine-group index ->
+    # that group's block ids in token-block order. ``block_ids`` above
+    # stays the primary (attention) group for the single-shape paths;
+    # ``None`` keeps the legacy single-group behavior.
+    group_block_ids: Optional[dict] = None
 
 
 @dataclass

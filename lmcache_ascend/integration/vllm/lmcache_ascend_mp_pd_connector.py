@@ -871,15 +871,14 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 end = handled // chunk * chunk
             else:
                 end = spec.num_prompt_tokens
-            block_ids = self._flatten_single_group_block_ids(
+            block_ids, group_block_ids = self._group_block_ids(
                 tracker.allocated_block_ids
             )
             if block_ids is None:
                 logger.warning(
-                    "PD leg: req %s has %d kv cache groups; only single "
-                    "group is supported, PD send skipped",
+                    "PD leg: req %s has no allocated blocks yet; PD "
+                    "send skipped",
                     req_id,
-                    len(tracker.allocated_block_ids),
                 )
                 continue
             end = min(end, len(block_ids) * block_size)
@@ -894,6 +893,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     receiver_alloc_port=spec.receiver_alloc_port,
                     token_ids=tracker.get_token_ids(),
                     block_ids=block_ids,
+                    group_block_ids=group_block_ids,
                     block_size=block_size,
                     start=spec.sent_end,
                     end=end,
@@ -904,11 +904,21 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         return instructions
 
     @staticmethod
-    def _flatten_single_group_block_ids(allocated: dict) -> Optional[list]:
-        groups = list(allocated.values())
-        if len(groups) != 1:
-            return None
-        return list(groups[0])
+    def _group_block_ids(allocated: dict) -> tuple[Optional[list], dict]:
+        """Extract per-engine-group block ids from the request tracker.
+
+        ``allocated`` maps engine-group index to that group's block
+        ids in token-block order (single-group models carry only group
+        0). Returns the primary (attention) group's flat list for the
+        legacy single-shape paths plus the full per-group mapping for
+        the hybrid sender; ``(None, {})`` when nothing is allocated.
+        """
+        if not allocated:
+            return None, {}
+        group_block_ids = {
+            int(group): list(ids) for group, ids in sorted(allocated.items())
+        }
+        return group_block_ids.get(0, []), group_block_ids
 
     def _pd_union_prefix(self, request: "Request", l1_tokens: int) -> int:
         """How far the union of (L1 hit + arrived PD chunks) reaches.
@@ -1109,7 +1119,10 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             tracker = trackers.get(req_id)
             if tracker is None:
                 continue
-            block_ids = self._flatten_single_group_block_ids(
+            # Landing uses the primary (attention) group's blocks for
+            # now; recurrent-group landing arrives with the hybrid
+            # receiver-side scatter.
+            block_ids, _group_block_ids = self._group_block_ids(
                 tracker.allocated_block_ids
             )
             if block_ids is None:
