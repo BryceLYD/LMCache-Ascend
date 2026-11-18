@@ -172,7 +172,12 @@ def build_group_geometries(
         chunk_size: PD chunk size in tokens (attention object width).
 
     Returns:
-        One :class:`KVGroupGeometry` per detected group, or ``None``
+        One :class:`KVGroupGeometry` per detected group, ordered with
+        attention groups first (each by first layer index) and
+        recurrent groups after -- the combined-object protocol treats
+        the FIRST shape as the primary attention group (token
+        dimension, partial-chunk narrowing), and interleaved hybrid
+        models (e.g. Qwen3.8) start with a linear layer. ``None``
         when any entry is unclassifiable or nothing is registered --
         the caller then falls back to the legacy model-config
         geometry.
@@ -227,5 +232,7 @@ def build_group_geometries(
         )
         for page, indices in rec_groups.items()
     )
-    geometries.sort(key=lambda geometry: geometry.layer_indices[0])
+    geometries.sort(
+        key=lambda geometry: (geometry.recurrent, geometry.layer_indices[0])
+    )
     return geometries

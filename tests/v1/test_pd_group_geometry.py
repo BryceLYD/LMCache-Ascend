@@ -95,6 +95,26 @@ def test_raw_page_view_entry_is_recurrent():
     assert group.dtype is torch.uint8
 
 
+def test_linear_first_interleaving_keeps_attention_first():
+    """Qwen3.8-style layering: the FIRST layer is linear, but the
+    attention group must still come back first (the combined-object
+    protocol reads the primary shape from index 0)."""
+    kv_caches = {
+        "layer.0": _state_list(),
+        "layer.1": _attn_pair(),
+        "layer.2": _state_list(),
+    }
+
+    geometries = build_group_geometries(kv_caches, torch.bfloat16, CHUNK)
+
+    assert len(geometries) == 2
+    attn, rec = geometries
+    assert not attn.recurrent
+    assert attn.layer_indices == (1,)
+    assert rec.recurrent
+    assert rec.layer_indices == (0, 2)
+
+
 def test_none_entry_is_skipped():
     kv_caches = {"layer.0": None, "layer.1": _attn_pair()}
     geometries = build_group_geometries(kv_caches, torch.bfloat16, CHUNK)
