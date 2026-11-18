@@ -50,6 +50,7 @@ from vllm.logger import init_logger
 import torch
 
 # First Party
+from lmcache_ascend.v1.mp_pd.group_geometry import build_group_geometries
 from lmcache_ascend.v1.npu_connector.npu_connectors import VLLMPagedMemNPUConnectorV2
 from lmcache_ascend.v1.storage_backend.pd.backend import AscendPDBackend
 from lmcache_ascend.v1.storage_backend.utils import release_memory_objects
@@ -500,6 +501,30 @@ class PDEngine:
         kv_dtype = get_kv_cache_torch_dtype(
             vllm_config.cache_config.cache_dtype, model_cfg.dtype
         )
+        geometries = build_group_geometries(
+            kv_caches, kv_dtype, self.chunk_size
+        )
+        self.kv_group_geometries = geometries
+        if geometries is None:
+            logger.warning(
+                "PD: not every registered KV cache could be "
+                "classified; hybrid grouping is unavailable and the "
+                "legacy model-config geometry applies"
+            )
+        elif len(geometries) != 1 or geometries[0].recurrent:
+            parts = []
+            for group in geometries:
+                kind = " recurrent" if group.recurrent else ""
+                parts.append(
+                    f"layers={list(group.layer_indices)} "
+                    f"shape={tuple(group.shape)} "
+                    f"dtype={group.dtype}{kind}"
+                )
+            raise NotImplementedError(
+                "PD transfer for hybrid (multi-group) KV caches "
+                f"is not wired yet; {len(geometries)} groups: "
+                + "; ".join(parts)
+            )
         num_layers = model_cfg.get_num_layers(parallel_cfg)
         num_kv_heads = model_cfg.get_num_kv_heads(parallel_cfg)
         head_size = model_cfg.get_head_size()
