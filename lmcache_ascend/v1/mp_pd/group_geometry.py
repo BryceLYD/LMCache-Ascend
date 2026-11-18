@@ -54,6 +54,7 @@ class KVGroupGeometry:
     """
 
     layer_indices: tuple[int, ...]
+    layer_names: tuple[str, ...]
     shape: torch.Size
     dtype: torch.dtype
     recurrent: bool = False
@@ -62,6 +63,54 @@ class KVGroupGeometry:
     @property
     def num_layers(self) -> int:
         return len(self.layer_indices)
+
+
+def flat_state_page_view(entry, page_bytes: int) -> torch.Tensor:
+    """Flat ``[num_blocks, page_bytes]`` uint8 view of a state pool.
+
+    Accepts either form vLLM registers for a recurrent layer: the raw
+    ``[num_blocks, 1, 1, C]`` int8 page view, or a ``[state, ...]``
+    view list whose first state anchors the shared padded page (see
+    :func:`_state_list_page_bytes`). The returned view aliases the
+    pool storage -- no bytes are copied.
+
+    Raises:
+        ValueError: The entry matches no known form, or the shared
+            page contract is violated (would corrupt byte transfers).
+    """
+    if isinstance(entry, torch.Tensor):
+        if (
+            entry.ndim != 4
+            or entry.shape[1] != 1
+            or entry.shape[2] != 1
+            or entry.shape[3] != page_bytes
+        ):
+            raise ValueError(
+                f"raw page view {tuple(entry.shape)} does not match a "
+                f"{page_bytes}-byte state page"
+            )
+        return entry.reshape(entry.shape[0], page_bytes)
+    if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+        first = entry[0]
+        if not isinstance(first, torch.Tensor):
+            raise ValueError(
+                f"state entry holds a non-tensor "
+                f"{type(first).__name__}"
+            )
+        if (
+            first.storage_offset() != 0
+            or first.stride(0) * first.element_size() != page_bytes
+        ):
+            raise ValueError(
+                "recurrent state page contract violated: the first "
+                f"state does not anchor a {page_bytes}-byte page"
+            )
+        elems = page_bytes // first.element_size()
+        view = first.as_strided((first.shape[0], elems), (first.stride(0), 1))
+        return view.view(torch.uint8)
+    raise ValueError(
+        f"unsupported recurrent state pool entry {type(entry).__name__}"
+    )
 
 
 def _raw_page_view_bytes(entry) -> int | None:
@@ -188,7 +237,9 @@ def build_group_geometries(
             that cannot hold the states).
     """
     attn_groups: "OrderedDict[tuple[int, int], list[int]]" = OrderedDict()
+    attn_names: "OrderedDict[tuple[int, int], list[str]]" = OrderedDict()
     rec_groups: "OrderedDict[int, list[int]]" = OrderedDict()
+    rec_names: "OrderedDict[int, list[str]]" = OrderedDict()
 
     for idx, (name, entry) in enumerate(kv_caches.items()):
         if entry is None:
@@ -196,14 +247,17 @@ def build_group_geometries(
         page = _raw_page_view_bytes(entry)
         if page is not None:
             rec_groups.setdefault(page, []).append(idx)
+            rec_names.setdefault(page, []).append(name)
             continue
         geometry = _attention_geometry(entry)
         if geometry is not None:
             attn_groups.setdefault(geometry, []).append(idx)
+            attn_names.setdefault(geometry, []).append(name)
             continue
         page = _state_list_page_bytes(entry, name)
         if page is not None:
             rec_groups.setdefault(page, []).append(idx)
+            rec_names.setdefault(page, []).append(name)
             continue
         # Unclassifiable entry (e.g. MLA pairs): the caller falls
         # back to the legacy model-config geometry.
@@ -215,6 +269,7 @@ def build_group_geometries(
     geometries: list[KVGroupGeometry] = [
         KVGroupGeometry(
             layer_indices=tuple(indices),
+            layer_names=tuple(attn_names[(heads, head_dim)]),
             shape=torch.Size(
                 (len(indices), 2, chunk_size, heads, head_dim)
             ),
@@ -225,6 +280,7 @@ def build_group_geometries(
     geometries.extend(
         KVGroupGeometry(
             layer_indices=tuple(indices),
+            layer_names=tuple(rec_names[page]),
             shape=torch.Size((len(indices), page)),
             dtype=torch.uint8,
             recurrent=True,

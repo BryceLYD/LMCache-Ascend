@@ -50,7 +50,10 @@ from vllm.logger import init_logger
 import torch
 
 # First Party
-from lmcache_ascend.v1.mp_pd.group_geometry import build_group_geometries
+from lmcache_ascend.v1.mp_pd.group_geometry import (
+    build_group_geometries,
+    flat_state_page_view,
+)
 from lmcache_ascend.v1.npu_connector.npu_connectors import VLLMPagedMemNPUConnectorV2
 from lmcache_ascend.v1.storage_backend.pd.backend import AscendPDBackend
 from lmcache_ascend.v1.storage_backend.utils import release_memory_objects
@@ -613,14 +616,32 @@ class PDEngine:
         if not keys:
             return
 
+        token_dim = self.fmt.token_dim() if self.fmt is not None else 2
+        attn_group, rec_group, rec_block_ids = self._resolve_group_layout(
+            instr
+        )
+
         objs: list = []
         for s, e in zip(starts, ends, strict=False):
-            shape = list(self.metadata.kv_shape)
-            token_dim = self.fmt.token_dim() if self.fmt is not None else 2
-            shape[token_dim] = self.chunk_size if e - s >= self.chunk_size else e - s
-            obj = self.backend.allocate(
-                torch.Size(shape), self.metadata.kv_dtype, self.fmt
-            )
+            width = self.chunk_size if e - s >= self.chunk_size else e - s
+            if rec_group is None:
+                shape = list(self.metadata.kv_shape)
+                shape[token_dim] = width
+                obj = self.backend.allocate(
+                    torch.Size(shape), self.metadata.kv_dtype, self.fmt
+                )
+            else:
+                # Hybrid: one combined object per boundary -- the
+                # attention chunk first, the recurrent state page
+                # appended after it (opaque bytes; the buffer page
+                # layout matches: get_size_bytes sums the shape list).
+                attn_shape = list(attn_group.shape)
+                attn_shape[token_dim] = width
+                obj = self.backend.allocate(
+                    [torch.Size(attn_shape), rec_group.shape],
+                    [attn_group.dtype, rec_group.dtype],
+                    self.fmt,
+                )
             if obj is None:
                 logger.error(
                     "PD send: allocation failed for req %s chunk [%d,%d); "
@@ -652,13 +673,26 @@ class PDEngine:
         except Exception:
             pass
 
+        gather_kvcaches = kvcaches
+        if rec_group is not None:
+            # The NPU connector's pointer table is built from attention
+            # entries only; recurrent pools are gathered below as
+            # opaque page bytes.
+            gather_kvcaches = [
+                kvcaches[i] for i in attn_group.layer_indices
+            ]
         result = self.npu_connector.batched_from_gpu(
             objs,
             starts,
             ends,
-            kvcaches=kvcaches,
+            kvcaches=gather_kvcaches,
             slot_mapping=slot_mapping,
         )
+        if rec_group is not None:
+            self._gather_state_pages(
+                objs, ends, kvcaches, rec_group, rec_block_ids,
+                instr.block_size,
+            )
         if isinstance(result, float):
             logger.debug(
                 "PD copy-out for req %s: %d chunks in %.3fs",
@@ -691,6 +725,96 @@ class PDEngine:
     # ------------------------------------------------------------------
     # Receiver (D side)
     # ------------------------------------------------------------------
+
+    def _resolve_group_layout(self, instr: PDSendInstruction) -> tuple:
+        """Resolve (attention group, recurrent group, recurrent blocks).
+
+        Single-group models return ``(attn, None, None)`` so the legacy
+        metadata path runs unchanged. For hybrid sends the recurrent
+        group's vLLM block ids come from ``instr.group_block_ids`` keyed
+        by vLLM group index; the index is verified against the engine's
+        KV cache config (layer-name membership) and falls back to the
+        single non-primary group.
+        """
+        geometries = self.kv_group_geometries or []
+        attn_group = next((g for g in geometries if not g.recurrent), None)
+        rec_group = next((g for g in geometries if g.recurrent), None)
+        if attn_group is None or rec_group is None:
+            return attn_group, None, None
+
+        group_block_ids = instr.group_block_ids or {}
+        if len(group_block_ids) < 2:
+            raise ValueError(
+                f"PD hybrid send for req {instr.req_id}: instruction "
+                f"carries {len(group_block_ids)} block-id groups; the "
+                "recurrent group has no block ids"
+            )
+        rec_idx = None
+        kv_cache_config = getattr(self.vllm_config, "kv_cache_config", None)
+        vllm_groups = (
+            getattr(kv_cache_config, "kv_cache_groups", None)
+            if kv_cache_config is not None
+            else None
+        )
+        if vllm_groups:
+            names = set(rec_group.layer_names)
+            for group_idx, group in enumerate(vllm_groups):
+                layer_names = set(getattr(group, "layer_names", None) or [])
+                if names and names.issubset(layer_names):
+                    rec_idx = group_idx
+                    break
+            if rec_idx is None:
+                raise ValueError(
+                    "PD hybrid send: no vLLM KV cache group holds the "
+                    f"recurrent layers {sorted(names)}"
+                )
+        else:
+            candidates = [i for i in group_block_ids if i != 0]
+            if len(candidates) != 1:
+                raise ValueError(
+                    "PD hybrid send: cannot identify the recurrent "
+                    f"group's block ids among {sorted(group_block_ids)}"
+                )
+            rec_idx = candidates[0]
+        return attn_group, rec_group, group_block_ids.get(rec_idx)
+
+    def _gather_state_pages(
+        self,
+        objs: list,
+        ends: list,
+        kvcaches,
+        rec_group,
+        rec_block_ids,
+        block_size: int,
+    ) -> None:
+        """Copy each boundary's recurrent state page into the combined
+        object's tail slice, after the attention chunk bytes.
+
+        The page holds the runner's live state after the block that
+        covers the chunk's last token (align mode), so the source block
+        index is ``(end - 1) // block_size``. Bytes are opaque -- no
+        rotary/positional processing may touch them.
+        """
+        if not rec_block_ids:
+            raise ValueError(
+                "PD hybrid send: no recurrent block ids on a hybrid "
+                "instruction"
+            )
+        page_views = [
+            flat_state_page_view(kvcaches[i], rec_group.page_size_bytes)
+            for i in rec_group.layer_indices
+        ]
+        page_bytes = rec_group.page_size_bytes
+        store_stream = self.npu_connector.store_stream
+        with torch.npu.stream(store_stream):
+            for obj, end in zip(objs, ends, strict=False):
+                blk = rec_block_ids[(end - 1) // block_size]
+                attn_bytes = obj.tensor.numel() * obj.tensor.element_size()
+                base = attn_bytes
+                for view in page_views:
+                    obj.raw_data[base : base + page_bytes].copy_(view[blk])
+                    base += page_bytes
+            store_stream.synchronize()
 
     def received_prefix_tokens(self, token_ids: list) -> int:
         """Chunk-aligned prefix length of ``token_ids`` whose KV has

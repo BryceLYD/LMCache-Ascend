@@ -6,7 +6,10 @@ import pytest
 import torch
 
 # First Party
-from lmcache_ascend.v1.mp_pd.group_geometry import build_group_geometries
+from lmcache_ascend.v1.mp_pd.group_geometry import (
+    build_group_geometries,
+    flat_state_page_view,
+)
 
 CHUNK = 256
 
@@ -173,3 +176,52 @@ def test_mla_style_pair_returns_none():
     v = torch.empty((2, 16, 64), dtype=torch.bfloat16)
 
     assert build_group_geometries({"layer.0": (k, v)}, torch.bfloat16, CHUNK) is None
+
+
+def test_hybrid_groups_carry_layer_names():
+    kv_caches = {
+        "layer.0": _state_list(),
+        "layer.1": _attn_pair(),
+        "layer.2": _attn_pair(),
+    }
+    geometries = build_group_geometries(kv_caches, torch.bfloat16, CHUNK)
+
+    attn, rec = geometries
+    assert attn.layer_names == ("layer.1", "layer.2")
+    assert rec.layer_names == ("layer.0",)
+
+
+def test_flat_state_page_view_raw_form():
+    entry = torch.arange(5 * 1000, dtype=torch.int8).reshape(5, 1, 1, 1000)
+    view = flat_state_page_view(entry, 1000)
+
+    assert view.shape == (5, 1000)
+    assert view.dtype is torch.int8
+    assert view[2].data_ptr() == entry[2, 0, 0].data_ptr()
+    assert torch.equal(view[3], entry[3, 0, 0])
+
+
+def test_flat_state_page_view_state_list_form():
+    pages, page_bytes = 5, 1280
+    raw = torch.arange(pages * page_bytes, dtype=torch.uint8).reshape(
+        pages, page_bytes
+    )
+    conv = raw[:, :768].view(torch.bfloat16).view(pages, 3, 128)
+    ssm = raw[:, 768:].view(torch.float32).view(pages, 2, 64)
+    view = flat_state_page_view([conv, ssm], page_bytes)
+
+    assert view.shape == (pages, page_bytes)
+    assert view.dtype is torch.uint8
+    assert torch.equal(view[1], raw[1])
+
+
+def test_flat_state_page_view_contract_violations():
+    entry = torch.empty((5, 1, 1, 999), dtype=torch.int8)
+    with pytest.raises(ValueError, match="does not match"):
+        flat_state_page_view(entry, 1000)
+
+    raw = torch.empty((5, 1792), dtype=torch.uint8)
+    conv = torch.as_strided(raw, (5, 3, 128), (1792, 128, 1))
+    ssm = torch.as_strided(raw, (5, 2, 64), (1792, 64, 1), storage_offset=768)
+    with pytest.raises(ValueError, match="anchor"):
+        flat_state_page_view([conv, ssm], 768)
