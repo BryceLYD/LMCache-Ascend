@@ -517,13 +517,17 @@ class PDEngine:
             kv_caches, kv_dtype, self.chunk_size
         )
         self.kv_group_geometries = geometries
-        if geometries is None:
-            logger.warning(
-                "PD: not every registered KV cache could be "
-                "classified; hybrid grouping is unavailable and the "
-                "legacy model-config geometry applies"
-            )
-        elif len(geometries) != 1 or geometries[0].recurrent:
+        attn_count = (
+            sum(1 for g in geometries if not g.recurrent)
+            if geometries is not None
+            else 0
+        )
+        rec_count = (
+            sum(1 for g in geometries if g.recurrent)
+            if geometries is not None
+            else 0
+        )
+        if geometries is not None and (attn_count != 1 or rec_count > 1):
             parts = []
             for group in geometries:
                 kind = " recurrent" if group.recurrent else ""
@@ -533,21 +537,49 @@ class PDEngine:
                     f"dtype={group.dtype}{kind}"
                 )
             raise NotImplementedError(
-                "PD transfer for hybrid (multi-group) KV caches "
-                f"is not wired yet; {len(geometries)} groups: "
+                "PD transfer needs exactly one attention group and "
+                f"at most one recurrent group; got {len(geometries)}: "
                 + "; ".join(parts)
             )
-        num_layers = model_cfg.get_num_layers(parallel_cfg)
-        num_kv_heads = model_cfg.get_num_kv_heads(parallel_cfg)
-        head_size = model_cfg.get_head_size()
-        use_mla = mla_enabled(model_cfg)
-        kv_shape = (
-            num_layers,
-            1 if use_mla else 2,
-            self.chunk_size,
-            num_kv_heads,
-            head_size,
-        )
+        if geometries is None:
+            # Unclassifiable caches (e.g. MLA pairs): keep the legacy
+            # model-config geometry, unchanged.
+            logger.warning(
+                "PD: not every registered KV cache could be "
+                "classified; hybrid grouping is unavailable and the "
+                "legacy model-config geometry applies"
+            )
+            num_layers = model_cfg.get_num_layers(parallel_cfg)
+            num_kv_heads = model_cfg.get_num_kv_heads(parallel_cfg)
+            head_size = model_cfg.get_head_size()
+            use_mla = mla_enabled(model_cfg)
+            kv_shape = (
+                num_layers,
+                1 if use_mla else 2,
+                self.chunk_size,
+                num_kv_heads,
+                head_size,
+            )
+        else:
+            # Attention sorts first: geometries[0] is the primary
+            # group; a recurrent group, when present, follows.
+            attn_group = geometries[0]
+            use_mla = False
+            kv_shape = attn_group.shape
+            if rec_count:
+                rec = geometries[1]
+                rec_desc = (
+                    f"{rec.num_layers} layers, page={rec.page_size_bytes}B"
+                )
+            else:
+                rec_desc = "absent"
+            logger.info(
+                "PD KV groups: attention %d layers shape=%s; "
+                "recurrent %s",
+                attn_group.num_layers,
+                tuple(attn_group.shape),
+                rec_desc,
+            )
         metadata = LMCacheMetadata(
             model_name=model_cfg.model,
             world_size=parallel_cfg.world_size,

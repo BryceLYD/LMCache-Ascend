@@ -261,6 +261,20 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             or not self._pd_alloc_check_l1
         ):
             return
+        geometries = getattr(engine, "kv_group_geometries", None) or []
+        if any(group.recurrent for group in geometries):
+            # Combined objects carry the attention chunk AND the
+            # state page; the alloc-time dedup only observes
+            # attention-chunk residency, so an L1-covered chunk could
+            # strand its state page. Keep the dedup at buffer level
+            # for hybrid until the oracle is group-aware. The
+            # scheduler-side L1 lookup (the repeat-load path) is
+            # unaffected.
+            logger.info(
+                "MP+PD: hybrid KV groups detected; alloc-time L1 "
+                "dedup disabled (combined-object safety)"
+            )
+            return
         adapter = getattr(self, "worker_adapter", None)
         server_url = getattr(adapter, "_server_url", None)
         mp_chunk = getattr(adapter, "lmcache_tokens_per_chunk", None)
