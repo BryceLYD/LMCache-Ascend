@@ -36,6 +36,7 @@ needs the Step-6 "both" assembly and is rejected for now).
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Optional
+import copy
 import threading
 import time
 
@@ -178,6 +179,21 @@ class PDLoadInstruction:
 
 def _key_str(key) -> str:
     return key if isinstance(key, str) else key.to_string()
+
+
+class _ObjTensorView:
+    """Minimal MemoryObj surface for per-group V2 transfers.
+
+    The V2 gather/scatter kernels read ``tensor`` (the destination or
+    source view) and ``metadata`` (format checks only). A combined
+    object's per-group slice is re-viewed to the group's own storage
+    shape and wrapped in this shim so each group rides its own kernel
+    launch without disturbing the combined object itself.
+    """
+
+    def __init__(self, metadata, tensor):
+        self.metadata = metadata
+        self.tensor = tensor
 
 
 def build_pd_chunk_db(vllm_config: "VllmConfig", extra: dict) -> tuple:
@@ -527,23 +543,25 @@ class PDEngine:
             if geometries is not None
             else 0
         )
-        if geometries is not None and (attn_count != 1 or rec_count > 1):
+        if geometries is not None and (attn_count < 1 or rec_count > 1):
             parts = []
             for group in geometries:
                 kind = " recurrent" if group.recurrent else ""
+                if group.mla:
+                    kind += " mla"
                 parts.append(
                     f"layers={list(group.layer_indices)} "
                     f"shape={tuple(group.shape)} "
                     f"dtype={group.dtype}{kind}"
                 )
             raise NotImplementedError(
-                "PD transfer needs exactly one attention group and "
+                "PD transfer needs at least one attention group and "
                 f"at most one recurrent group; got {len(geometries)}: "
                 + "; ".join(parts)
             )
         if geometries is None:
-            # Unclassifiable caches (e.g. MLA pairs): keep the legacy
-            # model-config geometry, unchanged.
+            # Unclassifiable caches (e.g. exotic layouts): keep the
+            # legacy model-config geometry, unchanged.
             logger.warning(
                 "PD: not every registered KV cache could be "
                 "classified; hybrid grouping is unavailable and the "
@@ -561,24 +579,21 @@ class PDEngine:
                 head_size,
             )
         else:
-            # Attention sorts first: geometries[0] is the primary
-            # group; a recurrent group, when present, follows.
-            attn_group = geometries[0]
-            use_mla = False
-            kv_shape = attn_group.shape
-            if rec_count:
-                rec = geometries[1]
-                rec_desc = (
-                    f"{rec.num_layers} layers, page={rec.page_size_bytes}B"
-                )
-            else:
-                rec_desc = "absent"
+            # Attention sorts first; several attention groups (e.g.
+            # DeepSeek V4: dense-MLA layers + DSA layers with different
+            # flat widths) ride one combined object per boundary.
+            attn_groups = [g for g in geometries if not g.recurrent]
+            use_mla = any(g.mla for g in attn_groups)
+            kv_shape = attn_groups[0].shape
+            kv_dtype = attn_groups[0].dtype
             logger.info(
-                "PD KV groups: attention %d layers shape=%s; "
-                "recurrent %s",
-                attn_group.num_layers,
-                tuple(attn_group.shape),
-                rec_desc,
+                "PD KV groups: %d attention, %d recurrent, "
+                "use_mla=%s; primary shape=%s dtype=%s",
+                attn_count,
+                rec_count,
+                use_mla,
+                tuple(kv_shape),
+                kv_dtype,
             )
         metadata = LMCacheMetadata(
             model_name=model_cfg.model,
@@ -616,6 +631,24 @@ class PDEngine:
         self.npu_connector = VLLMPagedMemNPUConnectorV2.from_metadata(
             metadata, False, device
         )
+        # One NPU-connector instance per ATTENTION group (in geometry
+        # order). Each instance caches its own kvcaches pointer table,
+        # so per-group transfers stay isolated; recurrent groups copy
+        # opaque page bytes and need no instance. Group 0 aliases the
+        # legacy single-connector attribute.
+        self.npu_connectors: list = [self.npu_connector]
+        if geometries is not None:
+            for group in geometries[1:]:
+                if group.recurrent:
+                    continue
+                group_meta = copy.copy(metadata)
+                group_meta.kv_shape = group.shape
+                group_meta.use_mla = group.mla
+                self.npu_connectors.append(
+                    VLLMPagedMemNPUConnectorV2.from_metadata(
+                        group_meta, False, device
+                    )
+                )
         self.assembled = True
         logger.info(
             "PD engine assembled: role=%s chunk=%d channel=%s",
@@ -653,31 +686,36 @@ class PDEngine:
             return
 
         token_dim = self.fmt.token_dim() if self.fmt is not None else 2
-        attn_group, rec_group, rec_block_ids = self._resolve_group_layout(
+        attn_specs, (rec_group, rec_block_ids) = self._resolve_group_layout(
             instr.req_id, instr.group_block_ids
         )
+        multi_attn = len(attn_specs) > 1
 
         objs: list = []
         for s, e in zip(starts, ends, strict=False):
             width = self.chunk_size if e - s >= self.chunk_size else e - s
-            if rec_group is None:
+            if not multi_attn and rec_group is None:
                 shape = list(self.metadata.kv_shape)
                 shape[token_dim] = width
                 obj = self.backend.allocate(
                     torch.Size(shape), self.metadata.kv_dtype, self.fmt
                 )
             else:
-                # Hybrid: one combined object per boundary -- the
-                # attention chunk first, the recurrent state page
-                # appended after it (opaque bytes; the buffer page
-                # layout matches: get_size_bytes sums the shape list).
-                attn_shape = list(attn_group.shape)
-                attn_shape[token_dim] = width
-                obj = self.backend.allocate(
-                    [torch.Size(attn_shape), rec_group.shape],
-                    [attn_group.dtype, rec_group.dtype],
-                    self.fmt,
-                )
+                # One combined object per boundary: every attention
+                # group's (narrowed) chunk slice first, the recurrent
+                # state page appended after (opaque bytes; the buffer
+                # page layout matches: get_size_bytes sums the list).
+                shapes = []
+                dtypes = []
+                for group, _ids, _v2 in attn_specs:
+                    gshape = list(group.shape)
+                    gshape[token_dim] = width
+                    shapes.append(torch.Size(gshape))
+                    dtypes.append(group.dtype)
+                if rec_group is not None:
+                    shapes.append(rec_group.shape)
+                    dtypes.append(rec_group.dtype)
+                obj = self.backend.allocate(shapes, dtypes, self.fmt)
             if obj is None:
                 logger.error(
                     "PD send: allocation failed for req %s chunk [%d,%d); "
@@ -709,21 +747,28 @@ class PDEngine:
         except Exception:
             pass
 
-        gather_kvcaches = kvcaches
-        if rec_group is not None:
-            # The NPU connector's pointer table is built from attention
-            # entries only; recurrent pools are gathered below as
-            # opaque page bytes.
-            gather_kvcaches = [
-                kvcaches[i] for i in attn_group.layer_indices
-            ]
-        result = self.npu_connector.batched_from_gpu(
-            objs,
-            starts,
-            ends,
-            kvcaches=gather_kvcaches,
-            slot_mapping=slot_mapping,
-        )
+        result = None
+        if multi_attn:
+            self._gather_multi_attn(
+                objs, starts, ends, kvcaches, attn_specs,
+                instr.block_size, instr.end,
+            )
+        else:
+            gather_kvcaches = kvcaches
+            if rec_group is not None:
+                # The NPU connector's pointer table is built from
+                # attention entries only; recurrent pools are gathered
+                # below as opaque page bytes.
+                gather_kvcaches = [
+                    kvcaches[i] for i in attn_specs[0][0].layer_indices
+                ]
+            result = self.npu_connector.batched_from_gpu(
+                objs,
+                starts,
+                ends,
+                kvcaches=gather_kvcaches,
+                slot_mapping=slot_mapping,
+            )
         if rec_group is not None:
             self._gather_state_pages(
                 objs, ends, kvcaches, rec_group, rec_block_ids,
@@ -765,56 +810,188 @@ class PDEngine:
     def _resolve_group_layout(
         self, req_id: str, group_block_ids: Optional[dict]
     ) -> tuple:
-        """Resolve (attention group, recurrent group, recurrent blocks).
+        """Resolve per-group transfer specs for a send/load instruction.
 
-        Single-group models return ``(attn, None, None)`` so the legacy
-        metadata path runs unchanged. For hybrid sends the recurrent
-        group's vLLM block ids come from ``group_block_ids`` keyed by
-        vLLM group index; the index is verified against the engine's KV
-        cache config (layer-name membership) and falls back to the
-        single non-primary group.
+        Returns ``(attn_specs, rec_spec)`` where ``attn_specs`` is a
+        list of ``(group, block_ids, npu_connector)`` in geometry order
+        and ``rec_spec`` is ``(group, block_ids)`` or ``(None, None)``.
+
+        Each geometry group's vLLM block-id index is verified against
+        the engine's KV cache config (layer-name membership). The
+        single-group case falls back to the primary group's ids, so the
+        legacy paths run unchanged.
         """
         geometries = self.kv_group_geometries or []
-        attn_group = next((g for g in geometries if not g.recurrent), None)
+        attn_groups = [g for g in geometries if not g.recurrent]
         rec_group = next((g for g in geometries if g.recurrent), None)
-        if attn_group is None or rec_group is None:
-            return attn_group, None, None
+        if not attn_groups and rec_group is None:
+            return [], (None, None)
 
-        group_block_ids = group_block_ids or {}
-        if len(group_block_ids) < 2:
+        ids = group_block_ids or {}
+        if len(ids) != len(geometries):
             raise ValueError(
-                f"PD hybrid send for req {req_id}: instruction "
-                f"carries {len(group_block_ids)} block-id groups; the "
-                "recurrent group has no block ids"
+                f"PD hybrid transfer for req {req_id}: instruction "
+                f"carries {len(ids)} block-id groups but the engine "
+                f"derived {len(geometries)} KV groups; per-group block "
+                "ids must match one-to-one"
             )
-        rec_idx = None
-        kv_cache_config = getattr(self.vllm_config, "kv_cache_config", None)
-        vllm_groups = (
-            getattr(kv_cache_config, "kv_cache_groups", None)
-            if kv_cache_config is not None
-            else None
+
+        def _vllm_idx(group):
+            kv_cache_config = getattr(
+                self.vllm_config, "kv_cache_config", None
+            )
+            vllm_groups = (
+                getattr(kv_cache_config, "kv_cache_groups", None)
+                if kv_cache_config is not None
+                else None
+            )
+            if vllm_groups:
+                names = set(group.layer_names)
+                for group_idx, vllm_group in enumerate(vllm_groups):
+                    layer_names = set(
+                        getattr(vllm_group, "layer_names", None) or []
+                    )
+                    if names and names.issubset(layer_names):
+                        return group_idx
+                raise ValueError(
+                    "PD hybrid transfer: no vLLM KV cache group "
+                    f"holds the layers {sorted(names)}"
+                )
+            if len(geometries) == 1:
+                return 0
+            raise ValueError(
+                "PD hybrid transfer: kv_cache_config is unavailable "
+                "and multi-group block ids cannot be identified for "
+                f"req {req_id}"
+            )
+
+        attn_specs = []
+        for group_idx, group in enumerate(attn_groups):
+            block_ids = ids.get(_vllm_idx(group))
+            if not block_ids:
+                raise ValueError(
+                    f"PD hybrid transfer for req {req_id}: no block "
+                    f"ids for attention group {group_idx}"
+                )
+            attn_specs.append(
+                (group, block_ids, self.npu_connectors[group_idx])
+            )
+        rec_spec = (None, None)
+        if rec_group is not None:
+            rec_spec = (rec_group, ids.get(_vllm_idx(rec_group)))
+        return attn_specs, rec_spec
+
+    @staticmethod
+    def _group_slot_mapping(block_ids, block_size: int, total: int):
+        """Attention slot mapping over ``range(total)`` for one group."""
+        slots = [
+            block_ids[pos // block_size] * block_size + pos % block_size
+            for pos in range(total)
+        ]
+        slot_mapping = torch.tensor(slots, dtype=torch.long)
+        try:
+            slot_mapping = slot_mapping.to("npu", non_blocking=True)
+        except Exception:
+            pass
+        return slot_mapping
+
+    def _group_tensor_view(self, obj, base: int, group, shape):
+        """Contiguous ``shape`` view of a combined object's group slice."""
+        nbytes = shape.numel() * group.dtype.itemsize
+        return (
+            obj.raw_data[base : base + nbytes]
+            .view(group.dtype)
+            .view(shape)
         )
-        if vllm_groups:
-            names = set(rec_group.layer_names)
-            for group_idx, group in enumerate(vllm_groups):
-                layer_names = set(getattr(group, "layer_names", None) or [])
-                if names and names.issubset(layer_names):
-                    rec_idx = group_idx
-                    break
-            if rec_idx is None:
-                raise ValueError(
-                    "PD hybrid send: no vLLM KV cache group holds the "
-                    f"recurrent layers {sorted(names)}"
+
+    def _gather_multi_attn(
+        self,
+        objs: list,
+        starts: list,
+        ends: list,
+        kvcaches,
+        attn_specs,
+        block_size: int,
+        total_end: int,
+    ) -> None:
+        """Gather every attention group into its combined-object slice.
+
+        Multi-attention-group models (e.g. DeepSeek V4: dense-MLA
+        layers and DSA layers with different flat widths) cannot ride
+        one rectangular object, so each group runs its own kernel
+        launch into its raw_data slice; the group's NPU-connector
+        instance owns that group's pointer table.
+        """
+        if not objs:
+            return
+        token_dim = self.fmt.token_dim() if self.fmt is not None else 2
+        slot_maps = [
+            self._group_slot_mapping(ids, block_size, total_end)
+            for _group, ids, _v2 in attn_specs
+        ]
+        store_stream = self.npu_connector.store_stream
+        with torch.npu.stream(store_stream):
+            for obj, s, e in zip(objs, starts, ends, strict=False):
+                width = self.chunk_size if e - s >= self.chunk_size else e - s
+                base = 0
+                for (group, _ids, v2), slot_map in zip(
+                    attn_specs, slot_maps, strict=False
+                ):
+                    gshape = list(group.shape)
+                    gshape[token_dim] = width
+                    view = self._group_tensor_view(
+                        obj, base, group, torch.Size(gshape)
+                    )
+                    v2.from_gpu(
+                        _ObjTensorView(obj.metadata, view),
+                        s,
+                        e,
+                        kvcaches=[kvcaches[i] for i in group.layer_indices],
+                        slot_mapping=slot_map,
+                        no_sync=True,
+                    )
+                    base += gshape.numel() * group.dtype.itemsize
+            store_stream.synchronize()
+
+    def _scatter_multi_attn(
+        self,
+        objs: list,
+        starts: list,
+        ends: list,
+        kvcaches,
+        attn_specs,
+        block_size: int,
+        total_end: int,
+    ) -> None:
+        """Scatter every attention group from its combined-object slice
+        into the paged pool -- the landing mirror of
+        ``_gather_multi_attn``."""
+        if not objs:
+            return
+        token_dim = self.fmt.token_dim() if self.fmt is not None else 2
+        slot_maps = [
+            self._group_slot_mapping(ids, block_size, total_end)
+            for _group, ids, _v2 in attn_specs
+        ]
+        for obj, s, e in zip(objs, starts, ends, strict=False):
+            width = self.chunk_size if e - s >= self.chunk_size else e - s
+            base = 0
+            for (group, _ids, v2), slot_map in zip(
+                attn_specs, slot_maps, strict=False
+            ):
+                gshape = list(group.shape)
+                gshape[token_dim] = width
+                view = self._group_tensor_view(
+                    obj, base, group, torch.Size(gshape)
                 )
-        else:
-            candidates = [i for i in group_block_ids if i != 0]
-            if len(candidates) != 1:
-                raise ValueError(
-                    "PD hybrid send: cannot identify the recurrent "
-                    f"group's block ids among {sorted(group_block_ids)}"
+                v2.to_gpu(
+                    _ObjTensorView(obj.metadata, view),
+                    s,
+                    e,
+                    kvcaches=[kvcaches[i] for i in group.layer_indices],
+                    slot_mapping=slot_map,
                 )
-            rec_idx = candidates[0]
-        return attn_group, rec_group, group_block_ids.get(rec_idx)
+                base += gshape.numel() * group.dtype.itemsize
 
     def _gather_state_pages(
         self,
@@ -847,8 +1024,9 @@ class PDEngine:
         with torch.npu.stream(store_stream):
             for obj, end in zip(objs, ends, strict=False):
                 blk = rec_block_ids[(end - 1) // block_size]
-                attn_bytes = obj.tensor.numel() * obj.tensor.element_size()
-                base = attn_bytes
+                # Attention region = everything before the state pages,
+                # valid for any number of attention groups.
+                base = obj.raw_data.numel() - len(page_views) * page_bytes
                 for view in page_views:
                     obj.raw_data[base : base + page_bytes].copy_(view[blk])
                     base += page_bytes
@@ -907,9 +1085,10 @@ class PDEngine:
                 instr.request_id,
             )
             return list(instr.block_ids), instr.start
-        attn_group, rec_group, rec_block_ids = self._resolve_group_layout(
+        attn_specs, (rec_group, rec_block_ids) = self._resolve_group_layout(
             instr.request_id, instr.group_block_ids
         )
+        multi_attn = len(attn_specs) > 1
         keys: list = []
         starts: list = []
         ends: list = []
@@ -950,36 +1129,42 @@ class PDEngine:
             copy_starts.append(s)
             copy_ends.append(e)
         if objs:
-            slots = []
-            for pos in range(instr.end):
-                slots.append(
-                    instr.block_ids[pos // instr.block_size]
-                    * instr.block_size
-                    + pos % instr.block_size
+            if multi_attn:
+                self._scatter_multi_attn(
+                    objs, copy_starts, copy_ends, kvcaches, attn_specs,
+                    instr.block_size, instr.end,
                 )
-            slot_mapping = torch.tensor(slots, dtype=torch.long)
-            try:
-                slot_mapping = slot_mapping.to("npu", non_blocking=True)
-            except Exception:
-                pass
-            scatter_kvcaches = kvcaches
-            if rec_group is not None:
-                # The NPU connector's pointer table is built from
-                # attention entries only; recurrent pools are scattered
-                # below as opaque page bytes.
-                scatter_kvcaches = [
-                    kvcaches[i] for i in attn_group.layer_indices
-                ]
-            result = self.npu_connector.batched_to_gpu(
-                objs,
-                copy_starts,
-                copy_ends,
-                kvcaches=scatter_kvcaches,
-                slot_mapping=slot_mapping,
-            )
-            if result is not None:
-                for _ in result:
+            else:
+                slots = []
+                for pos in range(instr.end):
+                    slots.append(
+                        instr.block_ids[pos // instr.block_size]
+                        * instr.block_size
+                        + pos % instr.block_size
+                    )
+                slot_mapping = torch.tensor(slots, dtype=torch.long)
+                try:
+                    slot_mapping = slot_mapping.to("npu", non_blocking=True)
+                except Exception:
                     pass
+                scatter_kvcaches = kvcaches
+                if rec_group is not None:
+                    # The NPU connector's pointer table is built from
+                    # attention entries only; recurrent pools are
+                    # scattered below as opaque page bytes.
+                    scatter_kvcaches = [
+                        kvcaches[i] for i in attn_specs[0][0].layer_indices
+                    ]
+                result = self.npu_connector.batched_to_gpu(
+                    objs,
+                    copy_starts,
+                    copy_ends,
+                    kvcaches=scatter_kvcaches,
+                    slot_mapping=slot_mapping,
+                )
+                if result is not None:
+                    for _ in result:
+                        pass
             if rec_group is not None:
                 self._scatter_state_pages(
                     objs,
@@ -1035,8 +1220,9 @@ class PDEngine:
         page_bytes = rec_group.page_size_bytes
         for obj, end in zip(objs, ends, strict=False):
             blk = rec_block_ids[(end - 1) // block_size]
-            attn_bytes = obj.tensor.numel() * obj.tensor.element_size()
-            base = attn_bytes
+            # Attention region = everything before the state pages,
+            # valid for any number of attention groups.
+            base = obj.raw_data.numel() - len(page_views) * page_bytes
             for view in page_views:
                 view[blk].copy_(obj.raw_data[base : base + page_bytes])
                 base += page_bytes

@@ -71,17 +71,31 @@ def _adjusted_group_shapes(
     fmt: MemoryFormat,
     last_chunk_toks: int,
 ) -> list[torch.Size]:
-    """Return *shapes* with the attention group narrowed on the last chunk.
+    """Return *shapes* with every attention group narrowed on the last
+    chunk.
 
-    Recurrent-state shapes have no token dimension and stay full-width
-    on every chunk (a state page is always a whole page).
+    Attention storage shapes are 5-dimensional (standard K/V and the
+    flat MLA plane alike) and carry the token dimension at
+    ``fmt.token_dim()``; recurrent-state pages are 2-dimensional and
+    stay full-width on every chunk (a state page is always a whole
+    page).
     """
-    alloc_shapes = list(shapes)
-    alloc_shapes[0] = torch.Size(
-        adjust_last_chunk_shape(
-            list(shapes[0]), idx, total_allocs, fmt, last_chunk_toks
-        )
-    )
+    alloc_shapes = []
+    for shape in shapes:
+        if len(shape) == 5:
+            alloc_shapes.append(
+                torch.Size(
+                    adjust_last_chunk_shape(
+                        list(shape),
+                        idx,
+                        total_allocs,
+                        fmt,
+                        last_chunk_toks,
+                    )
+                )
+            )
+        else:
+            alloc_shapes.append(shape)
     return alloc_shapes
 
 
