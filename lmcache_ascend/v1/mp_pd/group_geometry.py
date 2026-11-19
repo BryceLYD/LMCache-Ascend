@@ -43,7 +43,6 @@ byte-level transfer over such a layout would land misaligned.
 # Standard
 from collections import OrderedDict
 from dataclasses import dataclass
-import math
 
 # Third Party
 import torch
@@ -72,99 +71,80 @@ class KVGroupGeometry:
         return len(self.layer_indices)
 
 
-def flat_state_page_view(entry, page_bytes: int) -> torch.Tensor:
-    """Flat ``[num_blocks, page_bytes]`` uint8 view of a state pool.
+def flat_state_page_view(entry, region_bytes: int) -> list:
+    """Per-layer uint8 transfer views of one recurrent state pool.
 
-    Accepts either form vLLM registers for a recurrent layer: the raw
-    ``[num_blocks, 1, 1, C]`` int8 page view, or a ``[state, ...]``
-    view list whose first state anchors the shared padded page (see
-    :func:`_state_list_page_bytes`). The returned view aliases the
-    pool storage -- no bytes are copied.
+    Returns ``[(view, nbytes), ...]`` where every view is uint8
+    ``[num_blocks, nbytes]`` and the views concatenate to the layer's
+    per-block state region (their byte sizes sum to *region_bytes*).
+    Both known layouts are supported (mirroring upstream v0.5.7's two
+    mamba forms):
 
-    Raises:
-        ValueError: The entry matches no known form, or the shared
-            page contract is violated (would corrupt byte transfers).
+    * page-packed: the first state's per-block stride spans the whole
+      padded page; ONE view covers it, anchored at that state's own
+      pointer -- non-zero storage offsets (layers sharing one pool)
+      are fine;
+    * slice-planes (vLLM-Ascend <= v0.29): every state is a dense
+      contiguous slice; one uint8 plane per state.
+
+    The raw ``[num_blocks, 1, 1, C]`` int8 page view is also accepted
+    (one plane). Anything else raises.
     """
     if isinstance(entry, torch.Tensor):
         if (
             entry.ndim != 4
             or entry.shape[1] != 1
             or entry.shape[2] != 1
-            or entry.shape[3] != page_bytes
+            or entry.shape[3] != region_bytes
+            or entry.dtype not in (torch.int8, torch.uint8)
         ):
             raise ValueError(
                 f"raw page view {tuple(entry.shape)} does not match a "
-                f"{page_bytes}-byte state page"
+                f"{region_bytes}-byte state region"
             )
-        return entry.reshape(entry.shape[0], page_bytes)
-    if isinstance(entry, (tuple, list)) and len(entry) >= 2:
-        first = entry[0]
-        if not isinstance(first, torch.Tensor):
-            raise ValueError(
-                f"state entry holds a non-tensor "
-                f"{type(first).__name__}"
-            )
-        if (
-            first.storage_offset() != 0
-            or first.stride(0) * first.element_size() != page_bytes
-        ):
-            raise ValueError(
-                "recurrent state page contract violated: the first "
-                f"state does not anchor a {page_bytes}-byte page"
-            )
-        elems = page_bytes // first.element_size()
-        view = first.as_strided((first.shape[0], elems), (first.stride(0), 1))
-        return view.view(torch.uint8)
-    raise ValueError(
-        f"unsupported recurrent state pool entry {type(entry).__name__}"
+        return [(entry.reshape(entry.shape[0], region_bytes), region_bytes)]
+    if not isinstance(entry, (tuple, list)) or len(entry) < 2:
+        raise ValueError(
+            f"unsupported recurrent state pool entry "
+            f"{type(entry).__name__}"
+        )
+    first = entry[0]
+    for state in entry:
+        if not isinstance(state, torch.Tensor) or state.ndim < 2:
+            raise ValueError("recurrent states must be rank>=2 tensors")
+    num_blocks = int(first.shape[0])
+    stride_bytes = first.stride(0) * first.element_size()
+    content = sum(
+        (state.numel() // num_blocks) * state.element_size()
+        for state in entry
     )
-
-
-def _raw_page_view_bytes(entry) -> int | None:
-    """Byte width of a raw ``[num_blocks, 1, 1, C]`` int8 page view.
-
-    Newer vLLM versions register the mamba layer's whole padded page as
-    one int8 view instead of a state-view list. An attention cache can
-    never collide with this signature: paged attention caches put the
-    block size (>= 16) in dim 1, never a 1 x 1 pair.
-    """
-    if (
-        isinstance(entry, torch.Tensor)
-        and entry.ndim == 4
-        and entry.shape[1] == 1
-        and entry.shape[2] == 1
-        and entry.dtype in (torch.int8, torch.uint8)
-    ):
-        return int(entry.shape[3])
-    return None
-
-
-def _attention_geometry(entry) -> tuple[int, int] | None:
-    """``(num_kv_heads, head_size)`` for per-layer attention entries.
-
-    Accepts the three per-layer forms the Ascend worker registers:
-    ``(k, v)`` tensor pairs (same shape and dtype), merged
-    ``[2, num_blocks, block_size, H, D]`` tensors, and single
-    ``[num_blocks, block_size, H, D]`` caches. Returns ``None`` for
-    everything else (recurrent state lists included).
-    """
-    if isinstance(entry, torch.Tensor):
-        if entry.ndim == 5 and entry.shape[0] == 2:
-            return int(entry.shape[-2]), int(entry.shape[-1])
-        if entry.ndim == 4:
-            return int(entry.shape[-2]), int(entry.shape[-1])
-        return None
-    if isinstance(entry, (tuple, list)) and len(entry) == 2:
-        k, v = entry
-        if (
-            isinstance(k, torch.Tensor)
-            and isinstance(v, torch.Tensor)
-            and k.shape == v.shape
-            and k.dtype == v.dtype
-        ):
-            return int(k.shape[-2]), int(k.shape[-1])
-    return None
-
+    if stride_bytes >= content:
+        if stride_bytes != region_bytes:
+            raise ValueError(
+                f"page-packed stride {stride_bytes} does not match the "
+                f"region {region_bytes} derived at registration"
+            )
+        elems = stride_bytes // first.element_size()
+        view = first.as_strided(
+            (num_blocks, elems), (first.stride(0), 1)
+        )
+        return [(view.view(torch.uint8), stride_bytes)]
+    if content != region_bytes:
+        raise ValueError(
+            f"slice-planes content {content} does not match the region "
+            f"{region_bytes} derived at registration"
+        )
+    views = []
+    for state in entry:
+        if not state.is_contiguous():
+            raise ValueError(
+                "slice-planes states must be dense contiguous slices"
+            )
+        per_block = (state.numel() // num_blocks) * state.element_size()
+        views.append(
+            (state.reshape(num_blocks, -1).view(torch.uint8), per_block)
+        )
+    return views
 
 def _mla_plane_geometry(entry) -> tuple[int, torch.dtype] | None:
     """``(flat hidden width, dtype)`` for an MLA/DSA plane tuple.
@@ -212,48 +192,47 @@ def _mla_plane_geometry(entry) -> tuple[int, torch.dtype] | None:
 
 
 def _state_list_page_bytes(entry, name) -> int | None:
-    """Padded page size derived from a ``[state, ...]`` view list.
+    """Per-layer state region bytes for a ``[state, ...]`` view list.
 
-    vLLM lays mamba states out as one padded page per block
-    ``(conv | ssm | pad)``: every state is a view into the same
-    backing storage, the first one sits at the page base, and its
-    block stride spans the whole page -- the contract upstream
-    LMCache's mamba-page-view asserts. Entries whose tensors live in
-    separate storages (e.g. MLA ``(k, v)`` pairs) are not state
-    lists; return ``None`` so the caller treats them as unknown.
+    Two layouts exist (upstream v0.5.7's two mamba forms), keyed by
+    their per-layer byte footprint:
 
-    A confirmed state list that violates the page contract raises:
-    a byte-level transfer over it would land misaligned.
+    * page-packed: the first state's per-block stride spans the whole
+      padded page ``(conv | ssm | pad)``; the region is that stride --
+      layers sharing one pool anchor at their own pointer, so
+      non-zero storage offsets are fine;
+    * slice-planes (vLLM-Ascend <= v0.29): every state is a dense
+      contiguous slice of a shared pool; the region is the summed
+      state bytes, with no shared page at all.
+
+    Entries that are not state lists return ``None``; a state-like
+    entry matching NEITHER layout raises -- a byte-level transfer
+    must never guess.
     """
     if not isinstance(entry, (tuple, list)) or len(entry) < 2:
         return None
     for state in entry:
-        if not isinstance(state, torch.Tensor):
-            raise ValueError(
-                f"layer {name}: recurrent state entry holds a "
-                f"non-tensor {type(state).__name__}"
-            )
-    storages = {state.untyped_storage().data_ptr() for state in entry}
-    if len(storages) != 1:
-        return None
+        if not isinstance(state, torch.Tensor) or state.ndim < 2:
+            return None
     first = entry[0]
-    if first.storage_offset() != 0:
-        raise ValueError(
-            f"layer {name}: recurrent state does not view the page "
-            f"base (storage_offset={first.storage_offset()}); byte-"
-            f"level page transfer would land misaligned"
-        )
-    page = first.stride(0) * first.element_size()
+    num_blocks = int(first.shape[0])
+    if any(int(state.shape[0]) != num_blocks for state in entry):
+        return None
+    page_bytes = first.stride(0) * first.element_size()
     content = sum(
-        math.prod(state.shape[1:]) * state.element_size() for state in entry
+        (state.numel() // num_blocks) * state.element_size()
+        for state in entry
     )
-    if page < content:
-        raise ValueError(
-            f"layer {name}: page {page} bytes cannot hold the states "
-            f"({content} bytes); unexpected recurrent layout"
-        )
-    return page
-
+    if page_bytes >= content:
+        return page_bytes  # page-packed (offset-agnostic)
+    for state in entry:
+        if not state.is_contiguous():
+            raise ValueError(
+                f"layer {name}: recurrent states are neither page-packed "
+                f"(first per-block stride {page_bytes} < content "
+                f"{content}) nor contiguous per-state slices"
+            )
+    return content  # slice-planes: region = summed state bytes
 
 def build_group_geometries(
     kv_caches: dict,

@@ -126,7 +126,11 @@ def test_none_entry_is_skipped():
     assert geometries[0].layer_indices == (1,)
 
 
-def test_state_view_not_at_page_base_raises():
+def test_state_pool_nonzero_offset_classifies_page_packed():
+    """vLLM-Ascend layers share one pool: the conv state sits at a
+    layer-dependent non-zero storage offset, but its per-block stride
+    still spans the full padded page -- that is the page-packed form,
+    and it must classify (upstream v0.5.6 wrongly demanded offset 0)."""
     pages, page_bytes = 5, 1280
     raw = torch.empty((pages + 1, page_bytes), dtype=torch.uint8)
     conv = torch.as_strided(
@@ -138,21 +142,48 @@ def test_state_view_not_at_page_base_raises():
         storage_offset=page_bytes + 768,
     )
 
-    with pytest.raises(ValueError, match="does not view the page base"):
-        build_group_geometries(
-            {"layer.0": [conv, ssm]}, torch.bfloat16, CHUNK
-        )
+    geometries = build_group_geometries(
+        {"layer.0": [conv, ssm]}, torch.bfloat16, CHUNK
+    )
+
+    assert len(geometries) == 1
+    group = geometries[0]
+    assert group.recurrent
+    assert group.page_size_bytes == 1280
+    assert group.shape == torch.Size((1, 1280))
 
 
-def test_page_smaller_than_states_raises():
+def test_slice_planes_form_region_is_summed_states():
+    """vLLM-Ascend <= v0.29 registers conv and SSM as separate dense
+    contiguous slices: no shared page, region = summed state bytes."""
+    conv = torch.empty((5, 3, 2560), dtype=torch.bfloat16)
+    ssm = torch.empty((5, 2, 64), dtype=torch.float32)
+
+    geometries = build_group_geometries(
+        {"layer.0": [conv, ssm]}, torch.bfloat16, CHUNK
+    )
+
+    assert len(geometries) == 1
+    group = geometries[0]
+    assert group.recurrent
+    # conv 15360B + ssm 512B, no page padding
+    assert group.page_size_bytes == 15872
+    assert group.shape == torch.Size((1, 15872))
+    views = flat_state_page_view(
+        (conv, ssm), group.page_size_bytes
+    )
+    assert [nbytes for _view, nbytes in views] == [15360, 512]
+    assert views[0][0].shape == (5, 15360)
+    assert views[1][0].shape == (5, 512)
+
+
+def test_neither_page_packed_nor_contiguous_raises():
     pages = 5
     raw = torch.empty((pages, 1280), dtype=torch.uint8)
     conv = torch.as_strided(raw, (pages, 3, 128), (384, 128, 1))
-    ssm = torch.as_strided(
-        raw, (pages, 2, 64), (1280, 64, 1), storage_offset=768
-    )
+    ssm = torch.empty((pages, 2, 64), dtype=torch.float32)
 
-    with pytest.raises(ValueError, match="cannot hold the states"):
+    with pytest.raises(ValueError, match="neither page-packed"):
         build_group_geometries(
             {"layer.0": [conv, ssm]}, torch.bfloat16, CHUNK
         )
@@ -298,7 +329,9 @@ def test_mla_byte_total_not_itemsize_multiple_raises():
 
 def test_flat_state_page_view_raw_form():
     entry = torch.arange(5 * 1000, dtype=torch.int8).reshape(5, 1, 1, 1000)
-    view = flat_state_page_view(entry, 1000)
+    views = flat_state_page_view(entry, 1000)
+    assert [nbytes for _view, nbytes in views] == [1000]
+    view = views[0][0]
 
     assert view.shape == (5, 1000)
     assert view.dtype is torch.int8
@@ -313,8 +346,10 @@ def test_flat_state_page_view_state_list_form():
     )
     conv = raw[:, :768].view(torch.bfloat16).view(pages, 3, 128)
     ssm = raw[:, 768:].view(torch.float32).view(pages, 2, 64)
-    view = flat_state_page_view([conv, ssm], page_bytes)
+    views = flat_state_page_view([conv, ssm], page_bytes)
 
+    assert [nbytes for _view, nbytes in views] == [page_bytes]
+    view = views[0][0]
     assert view.shape == (pages, page_bytes)
     assert view.dtype is torch.uint8
     assert torch.equal(view[1], raw[1])
@@ -328,5 +363,10 @@ def test_flat_state_page_view_contract_violations():
     raw = torch.empty((5, 1792), dtype=torch.uint8)
     conv = torch.as_strided(raw, (5, 3, 128), (1792, 128, 1))
     ssm = torch.as_strided(raw, (5, 2, 64), (1792, 64, 1), storage_offset=768)
-    with pytest.raises(ValueError, match="anchor"):
+    with pytest.raises(ValueError, match="page-packed stride"):
         flat_state_page_view([conv, ssm], 768)
+
+    conv = torch.empty((5, 3, 2560), dtype=torch.bfloat16)
+    ssm = torch.empty((5, 2, 64), dtype=torch.float32)
+    with pytest.raises(ValueError, match="slice-planes content"):
+        flat_state_page_view([conv, ssm], 16000)

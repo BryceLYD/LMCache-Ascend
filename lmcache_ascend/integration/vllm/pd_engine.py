@@ -1026,21 +1026,29 @@ class PDEngine:
                 "PD hybrid send: no recurrent block ids on a hybrid "
                 "instruction"
             )
-        page_views = [
+        layer_views = [
             flat_state_page_view(kvcaches[i], rec_group.page_size_bytes)
             for i in rec_group.layer_indices
         ]
-        page_bytes = rec_group.page_size_bytes
+        region = rec_group.page_size_bytes
+        for views in layer_views:
+            got = sum(nbytes for _view, nbytes in views)
+            if got != region:
+                raise ValueError(
+                    f"state region drift: transfer views hold {got} "
+                    f"bytes but the geometry derived {region}"
+                )
         store_stream = self.npu_connector.store_stream
         with torch.npu.stream(store_stream):
             for obj, end in zip(objs, ends, strict=False):
                 blk = rec_block_ids[(end - 1) // block_size]
-                # Attention region = everything before the state pages,
-                # valid for any number of attention groups.
-                base = obj.raw_data.numel() - len(page_views) * page_bytes
-                for view in page_views:
-                    obj.raw_data[base : base + page_bytes].copy_(view[blk])
-                    base += page_bytes
+                # Attention region = everything before the state
+                # regions, valid for any number of attention groups.
+                base = obj.raw_data.numel() - len(layer_views) * region
+                for views in layer_views:
+                    for view, nbytes in views:
+                        obj.raw_data[base : base + nbytes].copy_(view[blk])
+                        base += nbytes
             store_stream.synchronize()
 
     def received_prefix_tokens(self, token_ids: list) -> int:
@@ -1247,19 +1255,27 @@ class PDEngine:
                 "PD hybrid load: no recurrent block ids on a hybrid "
                 "instruction"
             )
-        page_views = [
+        layer_views = [
             flat_state_page_view(kvcaches[i], rec_group.page_size_bytes)
             for i in rec_group.layer_indices
         ]
-        page_bytes = rec_group.page_size_bytes
+        region = rec_group.page_size_bytes
+        for views in layer_views:
+            got = sum(nbytes for _view, nbytes in views)
+            if got != region:
+                raise ValueError(
+                    f"state region drift: transfer views hold {got} "
+                    f"bytes but the geometry derived {region}"
+                )
         for obj, end in zip(objs, ends, strict=False):
             blk = rec_block_ids[(end - 1) // block_size]
-            # Attention region = everything before the state pages,
-            # valid for any number of attention groups.
-            base = obj.raw_data.numel() - len(page_views) * page_bytes
-            for view in page_views:
-                view[blk].copy_(obj.raw_data[base : base + page_bytes])
-                base += page_bytes
+            # Attention region = everything before the state
+            # regions, valid for any number of attention groups.
+            base = obj.raw_data.numel() - len(layer_views) * region
+            for views in layer_views:
+                for view, nbytes in views:
+                    view[blk].copy_(obj.raw_data[base : base + nbytes])
+                    base += nbytes
 
     def attach_l1_oracle(self, oracle: Optional["L1QueryOracle"]) -> None:
         """Inject the L1 residency oracle (receiver only).
