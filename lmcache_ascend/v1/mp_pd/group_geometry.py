@@ -327,7 +327,7 @@ def build_group_geometries(
         # back to the legacy model-config geometry.
         return None
 
-    if not attn_groups and not rec_groups:
+    if not attn_groups and not mla_groups and not rec_groups:
         return None
 
     geometries: list[KVGroupGeometry] = [
