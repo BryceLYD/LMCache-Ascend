@@ -191,6 +191,111 @@ def test_hybrid_groups_carry_layer_names():
     assert rec.layer_names == ("layer.0",)
 
 
+def _mla_planes(nb=4, bs=16, widths=(512, 64), dtype=torch.bfloat16):
+    return tuple(
+        torch.empty((nb, bs, 1, w), dtype=dtype) for w in widths
+    )
+
+
+def test_mla_two_plane_tuple_is_flat_mla_group():
+    kv_caches = {"l0": _mla_planes(), "l1": _mla_planes()}
+    geometries = build_group_geometries(kv_caches, torch.bfloat16, CHUNK)
+
+    assert len(geometries) == 1
+    group = geometries[0]
+    assert group.mla and not group.recurrent
+    assert group.shape == torch.Size((2, 1, CHUNK, 1, 576))
+    assert group.dtype is torch.bfloat16
+    assert group.layer_names == ("l0", "l1")
+
+
+def test_dsa_three_plane_tuple_flattens_indexer_width():
+    entry = _mla_planes(widths=(512, 64, 128))
+    geometries = build_group_geometries(
+        {"l0": entry}, torch.bfloat16, CHUNK
+    )
+
+    group = geometries[0]
+    assert group.mla
+    assert group.shape == torch.Size((1, 1, CHUNK, 1, 704))
+
+
+def test_v4_mixed_dtype_scale_flattens_bytes():
+    latent = torch.empty((4, 16, 1, 512), dtype=torch.int8)
+    scale = torch.empty((4, 16, 1, 32), dtype=torch.float16)
+    geometries = build_group_geometries(
+        {"l0": (latent, scale)}, torch.bfloat16, CHUNK
+    )
+
+    group = geometries[0]
+    # (512 * 1 + 32 * 2) bytes, one-byte primary dtype -> 576 elements
+    assert group.shape == torch.Size((1, 1, CHUNK, 1, 576))
+    assert group.dtype is torch.int8
+
+
+def test_v4_shared_pool_offset_views_classify_not_raise():
+    pool = torch.empty((4, 16, 1, 512 + 64), dtype=torch.bfloat16)
+    latent = pool[:, :, :, :512]
+    rope = pool[:, :, :, 512:]
+
+    geometries = build_group_geometries(
+        {"l0": (latent, rope)}, torch.bfloat16, CHUNK
+    )
+
+    assert len(geometries) == 1
+    assert geometries[0].mla
+    assert geometries[0].shape == torch.Size((1, 1, CHUNK, 1, 576))
+
+
+def test_one_head_kv_pair_stays_standard_attention():
+    k = torch.empty((4, 16, 1, 64), dtype=torch.bfloat16)
+    v = torch.empty((4, 16, 1, 64), dtype=torch.bfloat16)
+
+    geometries = build_group_geometries(
+        {"l0": (k, v)}, torch.bfloat16, CHUNK
+    )
+
+    group = geometries[0]
+    assert not group.mla
+    assert group.shape == torch.Size((1, 2, CHUNK, 1, 64))
+
+
+def test_dense_mla_and_dsa_layers_form_two_ordered_groups():
+    kv_caches = {
+        "l0": _mla_planes(widths=(512, 64)),
+        "l1": _mla_planes(widths=(512, 64, 128)),
+        "l2": _mla_planes(widths=(512, 64, 128)),
+    }
+    geometries = build_group_geometries(kv_caches, torch.bfloat16, CHUNK)
+
+    assert len(geometries) == 2
+    dense, dsa = geometries
+    assert dense.layer_indices == (0,)
+    assert dense.shape == torch.Size((1, 1, CHUNK, 1, 576))
+    assert dsa.layer_indices == (1, 2)
+    assert dsa.shape == torch.Size((2, 1, CHUNK, 1, 704))
+
+
+def test_latent_only_single_plane_tuple_is_mla():
+    entry = (torch.empty((4, 16, 1, 512), dtype=torch.bfloat16),)
+    geometries = build_group_geometries(
+        {"l0": entry}, torch.bfloat16, CHUNK
+    )
+
+    assert geometries[0].mla
+    assert geometries[0].shape == torch.Size((1, 1, CHUNK, 1, 512))
+
+
+def test_mla_byte_total_not_itemsize_multiple_raises():
+    latent = torch.empty((4, 16, 1, 512), dtype=torch.float16)
+    scale = torch.empty((4, 16, 1, 1), dtype=torch.int8)
+
+    with pytest.raises(ValueError, match="not a multiple"):
+        build_group_geometries(
+            {"l0": (latent, scale)}, torch.bfloat16, CHUNK
+        )
+
+
 def test_flat_state_page_view_raw_form():
     entry = torch.arange(5 * 1000, dtype=torch.int8).reshape(5, 1, 1, 1000)
     view = flat_state_page_view(entry, 1000)

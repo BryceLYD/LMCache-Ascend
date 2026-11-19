@@ -17,6 +17,12 @@ guessing, no runtime probing:
   ``[2, num_blocks, block_size, H, D]`` tensor, or a single
   ``[num_blocks, block_size, H, D]`` cache -- group by ``(H, D)``; the
   per-chunk storage shape is ``(layers, 2, chunk_size, H, D)``;
+* MLA/DSA plane entries (DeepSeek V2/V3/V3.2/V4 on vLLM-Ascend) -- a
+  tuple of ``[num_blocks, block_size, 1, width_i]`` planes whose widths
+  or dtypes differ (latent, rope, dsa index, V4 scale) -- group by the
+  flattened hidden width; the per-chunk storage shape is ONE flat
+  plane ``(layers, 1, chunk_size, 1, summed_width)`` (``kv_size == 1``,
+  the transfer kernels carve the planes back out per layer);
 * recurrent entries -- a ``[conv_state, ssm_state, ...]`` state-view
   list sharing one padded page per block ``(conv | ssm | pad)``, or a
   raw ``[num_blocks, 1, 1, C]`` int8 page view -- become recurrent
@@ -58,6 +64,7 @@ class KVGroupGeometry:
     shape: torch.Size
     dtype: torch.dtype
     recurrent: bool = False
+    mla: bool = False
     page_size_bytes: int = 0
 
     @property
@@ -159,6 +166,51 @@ def _attention_geometry(entry) -> tuple[int, int] | None:
     return None
 
 
+def _mla_plane_geometry(entry) -> tuple[int, torch.dtype] | None:
+    """``(flat hidden width, dtype)`` for an MLA/DSA plane tuple.
+
+    vLLM-Ascend registers DeepSeek MLA/DSA/V4 layers as a tuple of NP
+    paged planes ``[num_blocks, block_size, 1, width_i]`` with differing
+    widths -- and, on V4, differing dtypes (e.g. an int8 latent with an
+    fp16 scale plane). The transferred object is ONE flat plane of the
+    summed width in the first plane's dtype (upstream's
+    ``NL_X_NP_X_NB_BS_ONE_HS`` contract; the transfer kernels carve the
+    planes back out per layer). Planes may be views into one shared
+    pool with non-zero storage offsets -- that is normal here, unlike
+    on the recurrent state-page path.
+
+    Standard ``(k, v)`` tuples with identical shapes and dtypes never
+    reach this check (the attention branch catches them first); the
+    same-shape guard below is a second line of defense.
+    """
+    if not isinstance(entry, (tuple, list)) or len(entry) < 1:
+        return None
+    for plane in entry:
+        if not isinstance(plane, torch.Tensor):
+            return None
+        if plane.ndim != 4 or int(plane.shape[2]) != 1:
+            return None
+    first = entry[0]
+    if any(int(p.shape[0]) != int(first.shape[0]) for p in entry):
+        return None
+    if any(int(p.shape[1]) != int(first.shape[1]) for p in entry):
+        return None
+    widths = tuple(int(p.shape[3]) for p in entry)
+    dtypes = tuple(p.dtype for p in entry)
+    if len(entry) == 2 and widths[0] == widths[1] and dtypes[0] == dtypes[1]:
+        return None  # standard 1-head (k, v); the attention branch owns it
+    total_bytes = sum(
+        w * p.element_size() for w, p in zip(widths, entry, strict=True)
+    )
+    itemsize = first.element_size()
+    if total_bytes % itemsize != 0:
+        raise ValueError(
+            f"MLA plane byte total {total_bytes} is not a multiple of "
+            f"the primary plane itemsize {itemsize}; cannot flatten"
+        )
+    return total_bytes // itemsize, first.dtype
+
+
 def _state_list_page_bytes(entry, name) -> int | None:
     """Padded page size derived from a ``[state, ...]`` view list.
 
@@ -238,6 +290,12 @@ def build_group_geometries(
     """
     attn_groups: "OrderedDict[tuple[int, int], list[int]]" = OrderedDict()
     attn_names: "OrderedDict[tuple[int, int], list[str]]" = OrderedDict()
+    mla_groups: "OrderedDict[tuple[int, torch.dtype], list[int]]" = (
+        OrderedDict()
+    )
+    mla_names: "OrderedDict[tuple[int, torch.dtype], list[str]]" = (
+        OrderedDict()
+    )
     rec_groups: "OrderedDict[int, list[int]]" = OrderedDict()
     rec_names: "OrderedDict[int, list[str]]" = OrderedDict()
 
@@ -253,6 +311,12 @@ def build_group_geometries(
         if geometry is not None:
             attn_groups.setdefault(geometry, []).append(idx)
             attn_names.setdefault(geometry, []).append(name)
+            continue
+        mla = _mla_plane_geometry(entry)
+        if mla is not None:
+            hidden, mla_dtype = mla
+            mla_groups.setdefault((hidden, mla_dtype), []).append(idx)
+            mla_names.setdefault((hidden, mla_dtype), []).append(name)
             continue
         page = _state_list_page_bytes(entry, name)
         if page is not None:
@@ -277,6 +341,19 @@ def build_group_geometries(
         )
         for (heads, head_dim), indices in attn_groups.items()
     ]
+    geometries.extend(
+        KVGroupGeometry(
+            layer_indices=tuple(indices),
+            layer_names=tuple(mla_names[(hidden, mla_dtype)]),
+            # One flat plane of the summed width (kv_size == 1);
+            # the transfer kernels carve the per-plane layout back
+            # out of this contiguous hidden dimension.
+            shape=torch.Size((len(indices), 1, chunk_size, 1, hidden)),
+            dtype=mla_dtype,
+            mla=True,
+        )
+        for (hidden, mla_dtype), indices in mla_groups.items()
+    )
     geometries.extend(
         KVGroupGeometry(
             layer_indices=tuple(indices),
