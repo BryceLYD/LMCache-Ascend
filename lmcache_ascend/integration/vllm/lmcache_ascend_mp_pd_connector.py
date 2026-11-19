@@ -242,7 +242,64 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
     # Worker-side methods
     # ==============================
 
+    def _pd_dump_mamba_layout(self, kv_caches: dict) -> None:
+        """One-shot recurrent-layout dump (bring-up aid, env-gated).
+
+        Prints the registered recurrent entries' tensor geometry and the
+        matching MambaSpec fields so the actual vLLM-Ascend page layout
+        can be read from the log. No behavior change; enabled with
+        ``LMCACHE_ASCEND_DUMP_MAMBA=1``.
+        """
+        # Standard
+        import os
+
+        if not os.environ.get("LMCACHE_ASCEND_DUMP_MAMBA"):
+            return
+        kv_cache_config = getattr(self._vllm_config, "kv_cache_config", None)
+        spec_by_name: dict = {}
+        for group in getattr(kv_cache_config, "kv_cache_groups", None) or []:
+            spec = getattr(group, "kv_cache_spec", None)
+            for name in getattr(group, "layer_names", None) or []:
+                spec_by_name[name] = spec
+        shown = 0
+        for name, entry in kv_caches.items():
+            if shown >= 2:
+                break
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                continue
+            if not all(isinstance(t, torch.Tensor) for t in entry):
+                continue
+            spec = spec_by_name.get(name)
+            print(
+                f"[MAMBA-DUMP] layer={name} spec={type(spec).__name__} "
+                f"page_size_bytes={getattr(spec, 'page_size_bytes', None)} "
+                f"cache_mode={getattr(spec, 'mamba_cache_mode', None)} "
+                f"spec_blocks="
+                f"{getattr(spec, 'num_speculative_blocks', None)} "
+                f"spec_shapes={getattr(spec, 'shapes', None)} "
+                f"spec_dtypes={getattr(spec, 'dtypes', None)}",
+                flush=True,
+            )
+            for tag, tensor in enumerate(entry):
+                storage = tensor.untyped_storage()
+                block_stride = tensor.stride(0) * tensor.element_size()
+                print(
+                    f"[MAMBA-DUMP]   plane{tag}: shape={tuple(tensor.shape)}"
+                    f" dtype={tensor.dtype} stride={tensor.stride()} "
+                    f"elem_size={tensor.element_size()} "
+                    f"storage_offset={tensor.storage_offset()} "
+                    f"block_stride_bytes={block_stride} "
+                    f"tensor_ptr={hex(tensor.data_ptr())} "
+                    f"storage_ptr={hex(storage.data_ptr())} "
+                    f"storage_bytes={storage.nbytes()}",
+                    flush=True,
+                )
+            shown += 1
+        if shown == 0:
+            print("[MAMBA-DUMP] no recurrent list entries found", flush=True)
+
     def register_kv_caches(self, kv_caches: dict):
+        self._pd_dump_mamba_layout(kv_caches)
         super().register_kv_caches(kv_caches)
         if self._pd_engine is not None:
             # vLLM hands a {layer: tensor} dict; the NPU connector expects
