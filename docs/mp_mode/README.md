@@ -2,6 +2,8 @@
 
 MP mode is the multiprocess deployment architecture of LMCache: the KV cache is owned by a standalone `lmcache server` process, and vLLM attaches to it through the `LMCacheMPConnector`. The server owns L1/L2 storage, eviction, and lookup; the engine talks to it over the MP protocol (ZMQ control plane + shared-memory / device-handle data plane). Compared with running LMCache inside the vLLM process, this keeps cache work (store, retrieve, chunking, eviction) out of the engine loop and allows one cache to be shared by several engines.
 
+PD disaggregation (prefiller-to-decoder direct KV transfer on top of MP mode) is a fork feature tracked on the `mp-pd-dev` branch; its port to lmcache dev is documented in [mp_pd_dev_port.md](mp_pd_dev_port.md).
+
 The data plane has two transfer modes, selected with the `lmcache.mp.mp_transfer_mode` key in `kv_connector_extra_config`:
 
 | | `lmcache_driven` | `engine_driven` |

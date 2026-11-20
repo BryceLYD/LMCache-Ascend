@@ -455,3 +455,26 @@ class TestGroupGeometry:
             {"layer-0": torch.empty((3, 3, 3))}, torch.bfloat16, CHUNK
         )
         assert geos is None
+
+
+# ======================================================================
+# Commit 7 - docs: the design doc exists and states the frozen-snapshot
+# ground rules (cheap, but it pins the doc the PR ships).
+# ======================================================================
+
+class TestDocs:
+    def test_design_doc_exists_and_states_rules(self):
+        import os
+
+        doc = os.path.join(
+            os.path.dirname(__file__), "..", "..", "docs", "mp_mode",
+            "mp_pd_dev_port.md",
+        )
+        assert os.path.isfile(doc)
+        text = open(doc, encoding="utf-8").read()
+        assert "lmcache_v056" in text
+        assert "frozen" in text.lower()
+        # The hybrid state-page contracts the pipeline pins itself to.
+        assert "last boundary" in text.lower()
+        assert "tokens-per-block" in text.lower()
+        assert "null block" in text.lower()
