@@ -8,31 +8,36 @@ allocation, and key lookup/partitioning.
 """
 
 # Standard
+from __future__ import annotations
+
 from typing import Optional, Union
 import threading
 
 # Third Party
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
-from lmcache_ascend.v1.lmcache_v056.cache_key import CacheEngineKey
-from lmcache_ascend.v1.lmcache_v056.paged_cpu_gpu_memory_allocator import (
-    PagedCpuGpuMemoryAllocator,
-    PagedTensorMemoryAllocator,
-)
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
-from lmcache_ascend.v1.lmcache_v056.metadata import LMCacheMetadata
-from lmcache_ascend.v1.rpc_utils import get_zmq_context
-from lmcache_ascend.v1.lmcache_v056.pd_backend import PDBackend, PDConfig
 import torch
 import torch_npu  # noqa: F401
 import zmq
 
 # First Party
+from lmcache_ascend.v1.lmcache_v056.cache_key import CacheEngineKey
+from lmcache_ascend.v1.lmcache_v056.metadata import LMCacheMetadata
+from lmcache_ascend.v1.lmcache_v056.paged_cpu_gpu_memory_allocator import (
+    PagedCpuGpuMemoryAllocator,
+    PagedTensorMemoryAllocator,
+)
+from lmcache_ascend.v1.lmcache_v056.pd_backend import PDBackend, PDConfig
+from lmcache_ascend.v1.mp_pd.group_geometry import KVGroupGeometry
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 from lmcache_ascend.v1.rpc_utils import _find_free_port
 from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import AscendPDReceiverMixin
 from lmcache_ascend.v1.storage_backend.pd.sender_mixin import AscendPDSenderMixin
-from lmcache_ascend.v1.storage_backend.utils import resolve_memory_format
+from lmcache_ascend.v1.storage_backend.utils import (
+    release_memory_objects,
+    resolve_memory_format,
+)
 from lmcache_ascend.v1.transfer_channel import CreateTransferChannel, get_correct_device
 
 logger = init_logger(__name__)
@@ -51,16 +56,25 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
       :func:`lmcache_ascend.v1.transfer_channel.CreateTransferChannel`
       with both CPU and NPU buffers registered (multi-buffer pattern),
     * use UUID-based buffer references in alloc responses and transfer specs
-      (required by the channel's ``_resolve_remote_addrs``).
+      (required by the channel's ``_resolve_remote_addrs``),
+    * accept per-engine-group storage geometries (hybrid models):
+      every page then holds one chunk of ALL groups concatenated
+      (upstream ``get_size_bytes`` sums a shape list); ``None`` keeps
+      the legacy single-shape metadata path.
     """
 
     def __init__(
         self,
         config: LMCacheEngineConfig,
         metadata: LMCacheMetadata,
+        group_geometries: Optional[list[KVGroupGeometry]] = None,
     ):
         self.running = True
         self.tp_rank = metadata.worker_id
+        # Per-engine-group storage geometries (hybrid models). Read by
+        # initialize_allocator and the shape bookkeeping below; None
+        # keeps the legacy single-shape metadata path.
+        self.group_geometries = group_geometries
 
         # Optional L1 residency oracle (receiver only). Injected by the
         # MP+PD connector after assembly (see PDEngine.attach_l1_oracle);
@@ -184,8 +198,12 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         # Cache metadata for proxy creation on receiver side
         self._metadata = metadata
         self._fmt = resolve_memory_format(metadata.use_mla)
-        self._kv_shapes = [torch.Size(metadata.kv_shape)]
-        self._kv_dtypes = [metadata.kv_dtype]
+        if self.group_geometries is not None:
+            self._kv_shapes = [group.shape for group in self.group_geometries]
+            self._kv_dtypes = [group.dtype for group in self.group_geometries]
+        else:
+            self._kv_shapes = [torch.Size(metadata.kv_shape)]
+            self._kv_dtypes = [metadata.kv_dtype]
 
     def initialize_allocator(
         self, config: LMCacheEngineConfig, metadata: LMCacheMetadata
@@ -196,8 +214,12 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
 
         paged_mem_allocator = PagedCpuGpuMemoryAllocator()
         fmt = resolve_memory_format(metadata.use_mla)
-        sizes = [torch.Size(metadata.kv_shape)]
-        dtypes = [metadata.kv_dtype]
+        if self.group_geometries is not None:
+            sizes = [group.shape for group in self.group_geometries]
+            dtypes = [group.dtype for group in self.group_geometries]
+        else:
+            sizes = [torch.Size(metadata.kv_shape)]
+            dtypes = [metadata.kv_dtype]
         total_size = get_size_bytes(sizes, dtypes)
 
         if self.pd_config.buffer_device.startswith("npu"):
@@ -374,3 +396,24 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
             else:
                 new_indexes.append(idx)
         return already_sent_indexes, already_sent_objs, new_indexes
+
+    def release(self, key: CacheEngineKey) -> bool:
+        """Drop one landed chunk's staging copy and free its page.
+
+        Push-mode transfers stay in ``data`` until they land in vLLM's
+        paged pool; after the landing the staging copy is redundant
+        (the landed blocks are APC-covered and store-through persists
+        them to the decoder's L1, whose alloc-time oracle then skips
+        re-transfers), so the page returns to the receiver pool.
+        Without this the receiver buffer fills monotonically under
+        load. Consumed proxies manage their own lifecycle through the
+        pull path and are left alone.
+
+        Returns True when a regular staging object was released.
+        """
+        with self.data_lock:
+            mem_obj = self.data.pop(key, None)
+        if mem_obj is None or isinstance(mem_obj, ProxyMemoryObj):
+            return False
+        release_memory_objects([mem_obj])
+        return True

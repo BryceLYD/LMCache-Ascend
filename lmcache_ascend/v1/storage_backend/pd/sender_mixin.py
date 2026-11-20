@@ -14,14 +14,14 @@ import uuid as _uuid
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.utils import TORCH_DTYPE_TO_STR_DTYPE
-from lmcache_ascend.v1.lmcache_v056.cache_key import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
-from lmcache_ascend.v1.rpc_utils import get_zmq_socket
-from lmcache_ascend.v1.lmcache_v056.pd_backend import AllocRequest
 import msgspec
 import zmq
 
 # First Party
+from lmcache_ascend.v1.lmcache_v056.cache_key import CacheEngineKey
+from lmcache_ascend.v1.lmcache_v056.pd_backend import AllocRequest
+from lmcache_ascend.v1.rpc_utils import get_zmq_socket
 from lmcache_ascend.v1.storage_backend.pd.messages import (
     AscendAllocRequest,
     AscendAllocResponse,
@@ -368,6 +368,7 @@ class AscendPDSenderMixin:
 
         token_ids = getattr(transfer_spec, "token_ids", None)
         if token_ids:
+            meta = mem_objs[0].meta
             return AscendAllocRequest(
                 keys=str_keys,
                 fmt=fmt.value,
@@ -376,6 +377,10 @@ class AscendPDSenderMixin:
                 last_chunk_toks=last_chunk_toks,
                 token_ids=list(token_ids),
                 token_start=int(getattr(transfer_spec, "start", 0)),
+                shapes=[list(s) for s in (meta.shapes or ())],
+                dtypes=[
+                    TORCH_DTYPE_TO_STR_DTYPE[d] for d in (meta.dtypes or ())
+                ],
             )
         return AllocRequest(
             keys=str_keys,
@@ -623,6 +628,11 @@ class AscendPDSenderMixin:
             last_chunk_toks=last_chunk_toks,
             token_ids=list(getattr(transfer_spec, "token_ids", None) or []),
             token_start=int(getattr(transfer_spec, "start", 0)),
+            shapes=[list(s) for s in (memory_objs[0].meta.shapes or ())],
+            dtypes=[
+                TORCH_DTYPE_TO_STR_DTYPE[d]
+                for d in (memory_objs[0].meta.dtypes or ())
+            ],
         )
 
         # Send PullReadyNotif and receive ack.
