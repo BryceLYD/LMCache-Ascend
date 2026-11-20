@@ -11,10 +11,11 @@ import time
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.utils import STR_DTYPE_TO_TORCH_DTYPE, CacheEngineKey
+from lmcache.utils import STR_DTYPE_TO_TORCH_DTYPE
+from lmcache_ascend.v1.lmcache_v056.cache_key import CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
-from lmcache.v1.rpc_utils import get_zmq_socket
-from lmcache.v1.storage_backend.pd_backend import AllocRequest
+from lmcache_ascend.v1.rpc_utils import get_zmq_socket
+from lmcache_ascend.v1.lmcache_v056.pd_backend import AllocRequest
 import msgspec
 import torch
 import torch_npu  # noqa: F401

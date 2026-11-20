@@ -10,7 +10,7 @@ and receiver (decoder) over ZMQ side-channels, as well as the
 from typing import Union
 
 # Third Party
-from lmcache.v1.storage_backend.pd_backend import (
+from lmcache_ascend.v1.lmcache_v056.pd_backend import (
     AllocRequest,
     AllocResponse,
     ProxyNotif,

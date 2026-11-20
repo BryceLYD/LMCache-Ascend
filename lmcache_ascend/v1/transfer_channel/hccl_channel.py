@@ -11,17 +11,17 @@ from lmcache.v1.memory_allocators.mixed_memory_allocator import (
     MixedMemoryAllocator,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
-from lmcache.v1.rpc_utils import get_zmq_socket
-from lmcache.v1.transfer_channel.transfer_utils import (
-    InitSideMsgBase,
-    InitSideRetMsgBase,
-    SideMsg,
-)
 import msgspec
 import torch
 import zmq
 
 # First Party
+from lmcache_ascend.v1.lmcache_v056.transfer_utils import (
+    InitSideMsgBase,
+    InitSideRetMsgBase,
+    SideMsg,
+)
+from lmcache_ascend.v1.rpc_utils import get_zmq_socket
 import lmcache_ascend.hccl_npu_comms as hcomm
 
 # Local

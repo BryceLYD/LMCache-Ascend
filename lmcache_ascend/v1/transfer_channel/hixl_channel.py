@@ -8,17 +8,17 @@ import time
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.v1.memory_management import MemoryObj
-from lmcache.v1.rpc_utils import get_zmq_socket
-from lmcache.v1.transfer_channel.transfer_utils import (
-    InitSideMsgBase,
-    InitSideRetMsgBase,
-    SideMsg,
-)
 import msgspec
 import torch
 import zmq
 
 # First Party
+from lmcache_ascend.v1.lmcache_v056.transfer_utils import (
+    InitSideMsgBase,
+    InitSideRetMsgBase,
+    SideMsg,
+)
+from lmcache_ascend.v1.rpc_utils import get_zmq_socket
 import lmcache_ascend.hixl_npu_comms as hixl_comms
 
 # Local

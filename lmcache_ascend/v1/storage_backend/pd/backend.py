@@ -8,22 +8,23 @@ allocation, and key lookup/partitioning.
 """
 
 # Standard
+from __future__ import annotations
+
 from typing import Optional, Union
 import threading
 
 # Third Party
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
-from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_allocators.paged_cpu_gpu_memory_allocator import (
+from lmcache_ascend.v1.lmcache_v056.cache_key import CacheEngineKey
+from lmcache_ascend.v1.lmcache_v056.paged_cpu_gpu_memory_allocator import (
     PagedCpuGpuMemoryAllocator,
     PagedTensorMemoryAllocator,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
-from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.rpc_utils import get_zmq_context
-from lmcache.v1.storage_backend.pd_backend import PDBackend, PDConfig
+from lmcache_ascend.v1.lmcache_v056.metadata import LMCacheMetadata
+from lmcache_ascend.v1.rpc_utils import get_zmq_context
+from lmcache_ascend.v1.lmcache_v056.pd_backend import PDBackend, PDConfig
 import torch
 import torch_npu  # noqa: F401
 import zmq
