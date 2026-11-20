@@ -11,7 +11,7 @@ import sys
 
 # NOTE: Must be manually edited per each version and
 # is also used by the test infrastructure.
-LMCACHE_UPSTREAM_TAG = "v0.5.6"
+LMCACHE_UPSTREAM_TAG = "dev"
 LMCACHE_ASCEND_PATCHED = False
 
 

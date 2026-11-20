@@ -20,10 +20,10 @@ import threading
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata
-from lmcache.v1.transfer_channel.abstract import BaseTransferChannel
 import torch
 
 # First Party
+from lmcache_ascend.v1.lmcache_v056.channel_abstract import BaseTransferChannel
 from lmcache_ascend.v1.transfer_channel.transfer_spec import (
     TS_RECEIVER_ID,
     TS_REMOTE_BUFFER_UUIDS,

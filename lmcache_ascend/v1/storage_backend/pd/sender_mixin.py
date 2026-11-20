@@ -13,10 +13,14 @@ import uuid as _uuid
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.utils import TORCH_DTYPE_TO_STR_DTYPE, CacheEngineKey
+from lmcache.utils import TORCH_DTYPE_TO_STR_DTYPE
+from lmcache_ascend.v1.lmcache_v056.cache_key import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
-from lmcache.v1.rpc_utils import get_zmq_socket
-from lmcache.v1.storage_backend.pd_backend import AllocRequest, ProxyNotif
+from lmcache_ascend.v1.rpc_utils import get_zmq_socket
+from lmcache_ascend.v1.lmcache_v056.pd_backend import (
+    AllocRequest,
+    ProxyNotif,
+)
 import msgspec
 import zmq
 

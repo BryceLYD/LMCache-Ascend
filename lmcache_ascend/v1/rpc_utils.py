@@ -8,8 +8,35 @@ import socket
 
 # Third Party
 from lmcache.logging import init_logger
+import zmq
+import zmq.asyncio
 
 logger = init_logger(__name__)
+
+
+# NOTE(frozen-from-v0.5.6): lmcache dev removed the zmq context
+# helpers from lmcache.v1.rpc_utils. The PD direct-transfer chain
+# still needs them; copied here from LMCache v0.5.6 verbatim.
+def get_zmq_context(use_asyncio: bool = True):
+    if use_asyncio:
+        return zmq.asyncio.Context.instance()
+    else:
+        return zmq.Context.instance()
+
+
+def get_zmq_socket(
+    context, socket_path: str, protocol: str, role, bind_or_connect: str
+):
+    """Create a ZeroMQ socket with the specified protocol and role."""
+    socket_addr = f"{protocol}://{socket_path}"
+    socket = context.socket(role)
+    if bind_or_connect == "bind":
+        socket.bind(socket_addr)
+    elif bind_or_connect == "connect":
+        socket.connect(socket_addr)
+    else:
+        raise ValueError(f"Invalid bind_or_connect: {bind_or_connect}")
+    return socket
 
 ServiceKind = Literal[
     "lookup", "lookup_pure", "offload", "lookup_worker", "lookup_scheduler"
