@@ -55,8 +55,8 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (
     LMCacheMPWorkerMetadata,
 )
 from lmcache.integration.vllm.vllm_multi_process_adapter import LoadStoreOp
-from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
 from lmcache.v1.common.token_codec import pack_token_ids
+from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.logger import init_logger
@@ -125,6 +125,14 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         # build_connector_worker_meta call.
         self._pd_received: dict[str, int] = {}
         self._pd_arrived_pending: list = []
+        self._pd_removed_pending: list = []
+        # Requests this scheduler has ever given compute tokens to (the
+        # release signal of vLLM's WAITING_FOR_REMOTE_KVS can only be
+        # owed to requests that were never scheduled). Late PD
+        # landings for already-scheduled requests must not report
+        # finished_recving -- vLLM asserts the request is WAITING or
+        # FINISHED and dies otherwise.
+        self._pd_scheduled_reqs: set = set()
         self._pd_complete_logged: set[str] = set()
         self._pd_kv_caches: Optional[dict] = None
         # Step 6: producer-side save policy (both / pd_only / l1_only).
@@ -183,6 +191,11 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         self._pd_key_db = None
         self._pd_chunk_size = 0
         self._pd_load_issued: set[str] = set()
+        # Shared null (sentinel) block id, captured from vLLM's
+        # block pool at the first allocation that shows one.
+        # The hybrid load fails closed when the restore-point
+        # state slot is this block.
+        self._pd_null_block_id: Optional[int] = None
         # Step 6: scheduler-side confirmed-landed prefix per request
         # (worker-reported; the store-through source of truth).
         self._pd_landed: dict[str, int] = {}
@@ -235,7 +248,64 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
     # Worker-side methods
     # ==============================
 
+    def _pd_dump_mamba_layout(self, kv_caches: dict) -> None:
+        """One-shot recurrent-layout dump (bring-up aid, env-gated).
+
+        Prints the registered recurrent entries' tensor geometry and the
+        matching MambaSpec fields so the actual vLLM-Ascend page layout
+        can be read from the log. No behavior change; enabled with
+        ``LMCACHE_ASCEND_DUMP_MAMBA=1``.
+        """
+        # Standard
+        import os
+
+        if not os.environ.get("LMCACHE_ASCEND_DUMP_MAMBA"):
+            return
+        kv_cache_config = getattr(self._vllm_config, "kv_cache_config", None)
+        spec_by_name: dict = {}
+        for group in getattr(kv_cache_config, "kv_cache_groups", None) or []:
+            spec = getattr(group, "kv_cache_spec", None)
+            for name in getattr(group, "layer_names", None) or []:
+                spec_by_name[name] = spec
+        shown = 0
+        for name, entry in kv_caches.items():
+            if shown >= 2:
+                break
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                continue
+            if not all(isinstance(t, torch.Tensor) for t in entry):
+                continue
+            spec = spec_by_name.get(name)
+            print(
+                f"[MAMBA-DUMP] layer={name} spec={type(spec).__name__} "
+                f"page_size_bytes={getattr(spec, 'page_size_bytes', None)} "
+                f"cache_mode={getattr(spec, 'mamba_cache_mode', None)} "
+                f"spec_blocks="
+                f"{getattr(spec, 'num_speculative_blocks', None)} "
+                f"spec_shapes={getattr(spec, 'shapes', None)} "
+                f"spec_dtypes={getattr(spec, 'dtypes', None)}",
+                flush=True,
+            )
+            for tag, tensor in enumerate(entry):
+                storage = tensor.untyped_storage()
+                block_stride = tensor.stride(0) * tensor.element_size()
+                print(
+                    f"[MAMBA-DUMP]   plane{tag}: shape={tuple(tensor.shape)}"
+                    f" dtype={tensor.dtype} stride={tensor.stride()} "
+                    f"elem_size={tensor.element_size()} "
+                    f"storage_offset={tensor.storage_offset()} "
+                    f"block_stride_bytes={block_stride} "
+                    f"tensor_ptr={hex(tensor.data_ptr())} "
+                    f"storage_ptr={hex(storage.data_ptr())} "
+                    f"storage_bytes={storage.nbytes()}",
+                    flush=True,
+                )
+            shown += 1
+        if shown == 0:
+            print("[MAMBA-DUMP] no recurrent list entries found", flush=True)
+
     def register_kv_caches(self, kv_caches: dict):
+        self._pd_dump_mamba_layout(kv_caches)
         super().register_kv_caches(kv_caches)
         if self._pd_engine is not None:
             # vLLM hands a {layer: tensor} dict; the NPU connector expects
@@ -261,6 +331,23 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             or engine.pd_role != "receiver"
             or not self._pd_alloc_check_l1
         ):
+            return
+        geometries = getattr(engine, "kv_group_geometries", None) or []
+        attn_count = sum(1 for group in geometries if not group.recurrent)
+        if attn_count > 1 or any(
+            group.recurrent for group in geometries
+        ):
+            # Combined objects carry every group's slice; the
+            # alloc-time dedup only observes the primary group's
+            # residency, so an L1-covered boundary could strand the
+            # other groups. Keep the dedup at buffer level for
+            # multi-group caches until the oracle is group-aware. The
+            # scheduler-side L1 lookup (the repeat-load path) is
+            # unaffected.
+            logger.info(
+                "MP+PD: multi-group KV caches detected; alloc-time L1 "
+                "dedup disabled (combined-object safety)"
+            )
             return
         adapter = getattr(self, "worker_adapter", None)
         server_url = getattr(adapter, "_server_url", None)
@@ -384,6 +471,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         if engine is None or engine.pd_role != "receiver":
             return
         self._pd_arrived_pending.extend(engine.drain_arrived_keys())
+        self._pd_removed_pending.extend(engine.drain_removed_keys())
         metadata = self._get_connector_metadata()
         for req_meta in getattr(metadata, "requests", None) or []:
             req_id = req_meta.request_id
@@ -474,6 +562,14 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         signal for the same request (pure-PD cold start), and at most
         once per request. The store-through accounting flows through
         ``pd_loaded`` in every case, so nothing is lost.
+
+        A third shape exists that the worker cannot see: the request
+        was already scheduled (pending-wait timeout turned it into
+        self-recompute) and a LATE chunk lands afterwards -- its first
+        PD recving would target a RUNNING request. The scheduler-side
+        ``update_connector_output`` filters that by scheduling
+        knowledge; this method only suppresses what the worker can
+        observe.
         """
         if request_id in self._pd_recv_reported:
             return
@@ -543,6 +639,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             metadata is None
             and not self._pd_received
             and not self._pd_arrived_pending
+            and not self._pd_removed_pending
             and not self._pd_loaded_pending
         ):
             return None
@@ -557,9 +654,11 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         )
         out.pd_received = self._pd_received
         out.pd_arrived_keys = self._pd_arrived_pending
+        out.pd_removed_keys = self._pd_removed_pending
         out.pd_loaded = self._pd_loaded_pending
         self._pd_received = {}
         self._pd_arrived_pending = []
+        self._pd_removed_pending = []
         self._pd_loaded_pending = {}
         return out
 
@@ -579,15 +678,48 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ):
+        self._pd_capture_null_block_id(blocks)
         super().update_state_after_alloc(
             request, blocks, num_external_tokens
         )
         self._pd_maybe_capture_spec(request)
 
+    def _pd_capture_null_block_id(self, blocks) -> None:
+        """Learn the engine's shared null (sentinel) block id.
+
+        vLLM pads retired or skipped block-table slots with one
+        shared null block (``block_pool.null_block``,
+        ``is_null=True``). Landing a restore-point state page
+        there would silently lose it, so the hybrid load guards
+        on this id. Builds whose allocations never show a null
+        block leave the guard dormant.
+        """
+        if self._pd_null_block_id is not None:
+            return
+        try:
+            for group_blocks in (getattr(blocks, "blocks", None) or ()):
+                for blk in group_blocks:
+                    if blk is not None and getattr(blk, "is_null", False):
+                        self._pd_null_block_id = getattr(blk, "block_id")
+                        logger.info(
+                            "PD: captured engine null block id %s",
+                            self._pd_null_block_id,
+                        )
+                        return
+        except Exception:
+            # Block-object layouts vary across vLLM builds; without
+            # a capturable id the null-slot guard stays dormant.
+            pass
+
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
     ) -> "KVConnectorMetadata":
         metadata = super().build_connector_meta(scheduler_output)
+        for req_id, num in (
+            getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+        ).items():
+            if num > 0:
+                self._pd_scheduled_reqs.add(req_id)
         kv_role = getattr(
             getattr(self._vllm_config, "kv_transfer_config", None),
             "kv_role",
@@ -606,11 +738,44 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         super().update_connector_output(connector_output)
+        raw_recving = getattr(connector_output, "finished_recving", None)
+        if raw_recving:
+            # vLLM processes this output right after this call
+            # (_update_from_kv_xfer_finished) and asserts every
+            # finished_recving request is WAITING_FOR_REMOTE_KVS or
+            # already FINISHED. A late PD landing can fire a request's
+            # FIRST recving after the request was already scheduled
+            # (pending-wait timeout -> self-recompute start -> the
+            # tail chunk arrives); upstream's release recving only
+            # ever targets never-scheduled requests, so filtering by
+            # our scheduling knowledge keeps every legitimate signal
+            # and drops the engine-killing ones.
+            keep = {
+                req_id
+                for req_id in raw_recving
+                if req_id not in self._pd_scheduled_reqs
+            }
+            if len(keep) != len(raw_recving):
+                dropped = sorted(set(raw_recving) - keep)
+                logger.info(
+                    "MP+PD: dropped late finished_recving for %d "
+                    "already-scheduled request(s): %s",
+                    len(dropped),
+                    dropped[:4],
+                )
+                connector_output.finished_recving = keep
         meta = getattr(connector_output, "kv_connector_worker_meta", None)
         if not isinstance(meta, MPPDWorkerMetadata):
             return
         if meta.pd_arrived_keys:
             self._pd_arrived.update(meta.pd_arrived_keys)
+        removed = getattr(meta, "pd_removed_keys", None) or []
+        if removed:
+            # Staging copies released after landing: retire them so
+            # arrival walks never trust a freed copy. Repeat content
+            # resolves through APC / L1; the alloc-time L1 oracle
+            # skips re-transferring stored chunks.
+            self._pd_arrived.difference_update(removed)
         for req_id, landed in (getattr(meta, "pd_loaded", None) or {}).items():
             if landed > self._pd_landed.get(req_id, 0):
                 self._pd_landed[req_id] = landed
@@ -706,6 +871,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         self._pd_specs.pop(request.request_id, None)
         self._pd_load_issued.discard(request.request_id)
         self._pd_recv_reported.discard(request.request_id)
+        self._pd_scheduled_reqs.discard(request.request_id)
         self._pd_landed.pop(request.request_id, None)
         self._pd_pending_since.pop(request.request_id, None)
         return result
@@ -872,15 +1038,14 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                 end = handled // chunk * chunk
             else:
                 end = spec.num_prompt_tokens
-            block_ids = self._flatten_single_group_block_ids(
+            block_ids, group_block_ids = self._group_block_ids(
                 tracker.allocated_block_ids
             )
             if block_ids is None:
                 logger.warning(
-                    "PD leg: req %s has %d kv cache groups; only single "
-                    "group is supported, PD send skipped",
+                    "PD leg: req %s has no allocated blocks yet; PD "
+                    "send skipped",
                     req_id,
-                    len(tracker.allocated_block_ids),
                 )
                 continue
             end = min(end, len(block_ids) * block_size)
@@ -895,6 +1060,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     receiver_alloc_port=spec.receiver_alloc_port,
                     token_ids=tracker.get_token_ids(),
                     block_ids=block_ids,
+                    group_block_ids=group_block_ids,
                     block_size=block_size,
                     start=spec.sent_end,
                     end=end,
@@ -905,11 +1071,21 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
         return instructions
 
     @staticmethod
-    def _flatten_single_group_block_ids(allocated: dict) -> Optional[list]:
-        groups = list(allocated.values())
-        if len(groups) != 1:
-            return None
-        return list(groups[0])
+    def _group_block_ids(allocated: dict) -> tuple[Optional[list], dict]:
+        """Extract per-engine-group block ids from the request tracker.
+
+        ``allocated`` maps engine-group index to that group's block
+        ids in token-block order (single-group models carry only group
+        0). Returns the primary (attention) group's flat list for the
+        legacy single-shape paths plus the full per-group mapping for
+        the hybrid sender; ``(None, {})`` when nothing is allocated.
+        """
+        if not allocated:
+            return None, {}
+        group_block_ids = {
+            int(group): list(ids) for group, ids in sorted(allocated.items())
+        }
+        return group_block_ids.get(0, []), group_block_ids
 
     def _pd_union_prefix(self, request: "Request", l1_tokens: int) -> int:
         """How far the union of (L1 hit + arrived PD chunks) reaches.
@@ -1114,7 +1290,7 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
             tracker = trackers.get(req_id)
             if tracker is None:
                 continue
-            block_ids = self._flatten_single_group_block_ids(
+            block_ids, group_block_ids = self._group_block_ids(
                 tracker.allocated_block_ids
             )
             if block_ids is None:
@@ -1128,9 +1304,11 @@ class LMCacheAscendMPPDConnectorV1Dynamic(LMCacheMPConnector):
                     request_id=req_id,
                     token_ids=tracker.get_token_ids(),
                     block_ids=block_ids,
+                    group_block_ids=group_block_ids,
                     block_size=block_size,
                     start=start,
                     end=end,
+                    null_block_id=self._pd_null_block_id,
                 )
             )
             self._pd_load_issued.add(req_id)
